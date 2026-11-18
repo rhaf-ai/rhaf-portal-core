@@ -82,16 +82,24 @@ fn native_arch() -> anyhow::Result<&'static str> {
 }
 
 fn container_tool() -> anyhow::Result<&'static str> {
+    // `version` fails when the engine is unusable, such as a stopped Docker daemon.
+    let mut failures = Vec::new();
     for tool in ["docker", "podman"] {
-        if Command::new(tool)
-            .arg("--version")
-            .output()
-            .is_ok_and(|output| output.status.success())
-        {
-            return Ok(tool);
+        match Command::new(tool).arg("version").output() {
+            Ok(output) if output.status.success() => return Ok(tool),
+            Ok(output) => {
+                failures.push(format!(
+                    "{tool}: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+            Err(error) => failures.push(format!("{tool}: {error}")),
         }
     }
-    bail!("install Docker or Podman to build container images")
+    bail!(
+        "install Docker or Podman, and start the Docker daemon if needed, to build container images\n{}",
+        failures.join("\n")
+    )
 }
 
 fn run(command: &mut Command) -> anyhow::Result<()> {

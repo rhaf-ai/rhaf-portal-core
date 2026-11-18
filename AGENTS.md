@@ -52,10 +52,11 @@ cargo build-image --push --tag REGISTRY/GROUP/rhaf-portal-core:TAG
 cargo build-image-manifest --tag REGISTRY/GROUP/rhaf-portal-core:TAG
 ```
 
-Build tasks use Docker, with Podman as a fallback. Image tags have a native
-`-x86_64` or `-aarch64` suffix. Manifest publication requires Podman and both
-architecture images in the registry. CI builds each architecture on a native
-Linux runner. The runtime image uses UID 1001 and GID 0 for OpenShift support.
+Build tasks use Docker, with Podman as a fallback when Docker is unusable.
+Image tags have a native `-x86_64` or `-aarch64` suffix. Manifest publication
+requires Podman and both architecture images in the registry. CI builds each
+architecture on a native Linux runner. The runtime image uses UID 1001 and
+GID 0 for OpenShift support.
 
 Keep the Containerfile source-copy and cache-build stages synchronized when you
 add crates, build scripts, or source directories. Keep Rust versions synchronized

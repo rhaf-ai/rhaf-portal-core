@@ -167,8 +167,10 @@ ports. Publish management only through the authenticated proxy boundary
 described above.
 
 Use `-x86_64` on an Intel or AMD host. The build command adds the native
-architecture suffix. Docker takes precedence when both tools are installed.
-Use the same tool to run the image.
+architecture suffix. Docker takes precedence when `docker version` succeeds;
+otherwise the build uses Podman. A stopped Docker daemon or missing socket
+permission therefore selects Podman. Use the tool shown in the build output to
+run the image.
 
 To publish a multi-architecture image, run the first command on both Linux x86_64
 and ARM64 hosts. Then run the second command once. Manifest publication requires
