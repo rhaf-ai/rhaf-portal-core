@@ -76,7 +76,7 @@ jobs:
           path: crates/rhaf-api/openapi.json
           if-no-files-found: error
       - name: Set up Java for the controlled MCP fixture
-        uses: actions/setup-java@dded0888837ed1f317902acf8a20df0ad188d165 # v5.0.0
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
           distribution: temurin
           java-version: '21'
