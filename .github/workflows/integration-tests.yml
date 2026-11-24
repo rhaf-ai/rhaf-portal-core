@@ -16,6 +16,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
@@ -32,21 +34,34 @@ jobs:
             ${{ runner.os }}-cargo-
       - name: Build Core
         run: cargo build --workspace --locked --verbose
-      - name: Set up Java for the controlled MCP fixture
+      - name: Check out Portal tests
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: rhaf-ai/rhaf-portal-tests
+          ref: refs/heads/main
+          path: portal-tests-checkout
+          persist-credentials: false
+      - name: Record the Portal tests revision
+        id: fixture
+        run: |
+          revision=$(git -C portal-tests-checkout rev-parse HEAD)
+          printf 'revision=%s\n' "$revision" >> "$GITHUB_OUTPUT"
+          printf 'Portal tests revision: `%s`\n' "$revision" >> "$GITHUB_STEP_SUMMARY"
+      - name: Set up Java for Portal tests
         uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
           distribution: temurin
           java-version: '21'
-      - name: Build the controlled MCP fixture
-        id: fixture
+          cache: maven
+          cache-dependency-path: 'portal-tests-checkout/**/pom.xml'
+      - name: Run Portal integration tests
+        working-directory: portal-tests-checkout
         run: |
-          git clone https://github.com/rhaf-ai/rhaf-portal-tests.git "$RUNNER_TEMP/rhaf-portal-tests"
-          git -C "$RUNNER_TEMP/rhaf-portal-tests" checkout 2fa44efdbc42e01384d0bef5776b703cdb9956ab
-          mvn -B -f "$RUNNER_TEMP/rhaf-portal-tests/pom.xml" -pl fixtures/test-mcp-server -am package -DskipTests
-          printf 'revision=%s\n' "$(git -C "$RUNNER_TEMP/rhaf-portal-tests" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          mvn -B --no-transfer-progress verify -Pcore-integration \
+            -Dcore.binary="$GITHUB_WORKSPACE/target/debug/rhaf-portal-core"
       - name: Verify the embedded runtime
         env:
-          RHAF_MCP_FIXTURE_JAR: ${{ runner.temp }}/rhaf-portal-tests/fixtures/test-mcp-server/target/quarkus-app/quarkus-run.jar
+          RHAF_MCP_FIXTURE_JAR: ${{ github.workspace }}/portal-tests-checkout/fixtures/test-mcp-server/target/quarkus-app/quarkus-run.jar
           RHAF_MCP_FIXTURE_REVISION: ${{ steps.fixture.outputs.revision }}
         run: cargo test --locked --test runtime_integration -- --ignored --nocapture
       - name: Upload runtime integration evidence
@@ -55,4 +70,14 @@ jobs:
         with:
           name: runtime-integration-evidence
           path: target/runtime-evidence
+          if-no-files-found: ignore
+      - name: Upload Portal integration evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: portal-integration-evidence
+          path: |
+            portal-tests-checkout/**/target/surefire-reports/
+            portal-tests-checkout/portal-tests/target/failsafe-reports/
+            portal-tests-checkout/portal-tests/target/core-integration/
           if-no-files-found: ignore

@@ -167,8 +167,7 @@ fixture:
 
 ```bash
 cargo build --workspace --locked
-git clone https://github.com/rhaf-ai/rhaf-portal-tests.git /tmp/rhaf-portal-tests
-git -C /tmp/rhaf-portal-tests checkout 2fa44efdbc42e01384d0bef5776b703cdb9956ab
+git clone --branch main https://github.com/rhaf-ai/rhaf-portal-tests.git /tmp/rhaf-portal-tests
 mvn -B -f /tmp/rhaf-portal-tests/pom.xml -pl fixtures/test-mcp-server -am package -DskipTests
 RHAF_MCP_FIXTURE_JAR=/tmp/rhaf-portal-tests/fixtures/test-mcp-server/target/quarkus-app/quarkus-run.jar \
 RHAF_MCP_FIXTURE_REVISION="$(git -C /tmp/rhaf-portal-tests rev-parse HEAD)" \
@@ -190,9 +189,12 @@ It removes the test forward and stops both processes.
 
 Each run retains logs, fixture observations, configuration, and `result.json`
 under `target/runtime-evidence/run-*`. The dedicated `Integration Tests` reusable
-workflow runs the same check after the PR build, lint, and container jobs succeed.
-It uploads the evidence as `runtime-integration-evidence`. Only the integration
-workflow uses Java and Maven.
+workflow runs after the PR build, lint, and container jobs succeed. It checks
+out `main` from `rhaf-portal-tests` and runs the Java integration suite against
+the Core binary built from the PR's merge revision. The job summary records the
+tests commit. The Java build also
+packages the fixture for the Rust integration check. The workflow uploads
+`portal-integration-evidence` and `runtime-integration-evidence`.
 
 ## Container image
 
@@ -241,7 +243,7 @@ cargo build-image-manifest --tag REGISTRY/GROUP/rhaf-portal-core:TAG
 ## CI and releases
 
 - `pr-build`: build, unit tests, formatting, Clippy, and container builds.
-- `integration-tests`: run the controlled MCP check after the PR build, lint, and container jobs succeed.
+- `integration-tests`: run the Java Portal suite and Rust MCP check after the PR build, lint, and container jobs succeed.
 - `main-build`: Linux x86_64 and ARM64 builds and container publication.
 - `lychee-links`: Markdown links and formatting.
 - `early-access`: manually publish four-platform archives and rolling prereleases.
