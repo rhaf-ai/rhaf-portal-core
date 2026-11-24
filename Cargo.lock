@@ -4421,7 +4421,7 @@ dependencies = [
  "async-trait",
  "clap",
  "http",
- "nix 0.31.4",
+ "nix 0.32.0",
  "praxis-proxy-core",
  "praxis-proxy-protocol",
  "praxis-proxy-tls",
