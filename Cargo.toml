@@ -115,7 +115,3 @@ large_stack_frames = "warn"
 
 # Disallowed methods (configured in clippy.toml)
 disallowed_methods = "deny"
-
-[profile.dev]
-# Keep build and test checks from accumulating incremental artifacts in worktrees.
-incremental = false
