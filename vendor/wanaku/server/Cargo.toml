@@ -34,10 +34,6 @@ name = "app_assembly"
 path = "tests/app_assembly.rs"
 
 [[test]]
-name = "example_configs"
-path = "tests/example_configs.rs"
-
-[[test]]
 name = "wasm_host"
 path = "tests/wasm_host.rs"
 

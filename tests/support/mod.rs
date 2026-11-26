@@ -81,6 +81,16 @@ impl Harness {
     fn management_url(&self, path: &str) -> String {
         format!("http://{}{path}", self.management)
     }
+
+    async fn post_forward(&self, name: &str, address: &str) -> Result<http::Reply> {
+        self.http
+            .request(
+                reqwest::Method::POST,
+                &self.management_url("/api/v1/forwards"),
+                Some(&json!({"name": name, "address": address})),
+            )
+            .await
+    }
     fn fixture_url(&self, path: &str) -> String {
         format!("http://{}{path}", self.fixture)
     }

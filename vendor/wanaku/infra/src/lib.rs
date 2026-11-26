@@ -5,6 +5,7 @@ pub mod audit;
 pub mod credentials;
 pub mod llm;
 pub mod mcp_client;
+mod mcp_client_http;
 pub mod metrics;
 pub mod opa;
 pub mod persistence;

@@ -368,7 +368,6 @@ pub(super) async fn handle_forward_create(
 }
 
 fn parse_forward_registration(body: &str) -> Result<ForwardEntry, String> {
-    tracing::debug!(body = %body, "forward create request body");
     let forward: ForwardEntry = serde_json::from_str(body).map_err(|error| {
         warn!(%error, "invalid forward JSON");
         format!("invalid forward JSON: {error}")

@@ -21,6 +21,8 @@ use serde_json::Value;
 use wanaku_types::credentials::NormalizedOrigin;
 use wanaku_types::registry::McpServerInfo;
 
+use crate::mcp_client_http::DiscoveryHttpClient;
+
 const TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_TOOLS: usize = 500;
 const MAX_RESOURCES: usize = 500;
@@ -138,11 +140,18 @@ fn build_transport_with_headers(
     url: &str,
     headers: HashMap<HeaderName, HeaderValue>,
 ) -> impl rmcp::transport::Transport<rmcp::RoleClient> + use<> {
+    StreamableHttpClientTransport::from_config(transport_config(url, headers))
+}
+
+fn transport_config(
+    url: &str,
+    headers: HashMap<HeaderName, HeaderValue>,
+) -> StreamableHttpClientTransportConfig {
     let mut config = StreamableHttpClientTransportConfig::with_uri(url);
     if !headers.is_empty() {
         config = config.custom_headers(headers);
     }
-    StreamableHttpClientTransport::from_config(config)
+    config
 }
 
 #[expect(
@@ -588,11 +597,16 @@ pub async fn discover_forward(
     forward_headers: HashMap<HeaderName, HeaderValue>,
 ) -> Result<ForwardDiscovery, McpClientError> {
     let origin = NormalizedOrigin::from_address(url);
-    let transport = build_transport_with_headers(url, forward_headers);
+    let config = transport_config(url, forward_headers);
     // Transport errors can include the full request URL.
     let url = origin
         .as_ref()
         .map_or("<invalid origin>", NormalizedOrigin::as_str);
+    let http = DiscoveryHttpClient::new().map_err(|_| McpClientError::Connection {
+        url: url.to_owned(),
+        message: "failed to build MCP HTTP client".to_owned(),
+    })?;
+    let transport = StreamableHttpClientTransport::with_client(http, config);
 
     let client = tokio::time::timeout(TIMEOUT, Box::pin(client_config().serve(transport)))
         .await

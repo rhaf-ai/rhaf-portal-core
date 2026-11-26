@@ -9,9 +9,15 @@ The backport omits addresses from forward registration, startup, and reconnect
 logs. Discovery diagnostics use the normalized origin. Discovery errors omit
 transport and server error text that can contain the request URL. The client
 uses the original URL for every request.
+It also strips URLs from RMCP HTTP errors before the worker logs failed session
+GET and DELETE requests. Management registration omits request bodies from logs.
 
 The local manifests resolve Wanaku dependencies through the same Git pin as
 Core. Core builds the server library with the admin UI disabled.
+The vendored server includes the WASM fixtures used by its integration tests.
+The configuration examples and their tests live in the Wanaku repository.
+The Core process regression uses a controlled MCP server to exercise management
+registration and failed session GET and DELETE operations.
 
 To retire this backport, update all Wanaku pins to a revision that includes
 the redaction fix. Remove the Cargo patches and the vendored crates. Remove
