@@ -468,8 +468,12 @@ mod tests {
         ID, Lifecycle, LifecycleError, Registration, STATE, label, protects_forward,
         protects_namespace, reservation_owner, validate_discovery, validate_refresh,
     };
-    use wanaku_infra::registry::{DiscoveredForward, ForwardCapabilities, InMemoryRegistry};
-    use wanaku_types::registry::{ForwardEntry, NamespaceEntry, NamespaceRegistry, ToolRegistry};
+    use wanaku_infra::registry::{
+        DiscoveredForward, ForwardCapabilities, ForwardPublicationError, InMemoryRegistry,
+    };
+    use wanaku_types::registry::{
+        ForwardEntry, ForwardRegistry, NamespaceEntry, NamespaceRegistry, ToolRegistry,
+    };
 
     fn target(name: &str) -> Result<ForwardEntry> {
         Ok(serde_json::from_value(serde_json::json!({
@@ -629,6 +633,69 @@ mod tests {
             Err(LifecycleError::Conflict)
         );
         assert!(registry.get_namespace("unused-all").is_none());
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keep the publication order and persistence assertions in one race scenario"
+    )]
+    fn stale_reconnect_failure_preserves_newer_refresh_after_reload() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let backend = Arc::new(FilePersistence::new(dir.path().join("registry.json")));
+        let registry = InMemoryRegistry::with_persistence(backend.clone());
+        let name = "forward";
+        let mut forward = target(name)?;
+        forward.namespace = Some("base-all".to_owned());
+        forward.available = false;
+        registry.register_forward(forward);
+
+        let current = registry
+            .begin_forward_refresh(name)
+            .context("current probe")?;
+        registry.publish_forward_discovery(current, Err("current failure".to_owned()))?;
+        let reconnect = registry
+            .begin_forward_refresh(name)
+            .context("reconnect probe")?;
+        assert!(!reconnect.target().available);
+        assert_eq!(
+            reconnect.target().status_message.as_deref(),
+            Some("current failure")
+        );
+
+        // Hold the failed reconnect's request until the manual refresh publishes.
+        let manual = registry
+            .begin_forward_refresh(name)
+            .context("manual refresh")?;
+        let refreshed = registry.publish_forward_discovery(
+            manual,
+            Ok(DiscoveredForward {
+                server_info: None,
+                capabilities: ForwardCapabilities {
+                    tools: Vec::new(),
+                    resources: Vec::new(),
+                    prompts: Vec::new(),
+                },
+            }),
+        )?;
+        assert_eq!(refreshed.forward.address, reconnect.target().address);
+        assert_eq!(refreshed.forward.namespace, reconnect.target().namespace);
+        assert_eq!(
+            registry
+                .publish_forward_discovery(reconnect, Err("stale failure".to_owned()))
+                .map(|_| ()),
+            Err(ForwardPublicationError::Stale(name.to_owned())),
+        );
+
+        registry.flush_persistence(Duration::from_secs(2))?;
+        let restored = InMemoryRegistry::with_persistence(backend);
+        restored.load_persisted();
+        for registry in [registry, restored] {
+            let forward = registry.get_forward(name).context("refreshed forward")?;
+            assert!(forward.available);
+            assert_eq!(forward.status_message, None);
+        }
         Ok(())
     }
 

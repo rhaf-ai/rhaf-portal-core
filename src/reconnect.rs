@@ -38,6 +38,7 @@ impl Reconnect {
             let _commit = self.lifecycle.commit_guard().await;
             let registry = self.lifecycle.registry();
             if validate_refresh(registry, &target).is_ok() {
+                // Wanaku checks the probe generation before publishing either outcome.
                 let _ = apply_forward_update(registry, prepared);
             }
         }
