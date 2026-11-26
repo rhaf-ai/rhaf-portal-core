@@ -54,8 +54,14 @@ impl Harness {
     }
 
     pub(super) async fn register_forward(&self) -> Result<()> {
+        let body = json!({"name": "controlled-fixture", "address": self.fixture_url("/mcp")});
         let reply = self
-            .post_forward("controlled-fixture", &self.fixture_url("/mcp"))
+            .http
+            .request(
+                Method::POST,
+                &self.management_url("/api/v1/forwards"),
+                Some(&body),
+            )
             .await?;
         ensure!(
             reply.status == 200,

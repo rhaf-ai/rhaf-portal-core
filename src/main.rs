@@ -14,7 +14,7 @@ use clap::Parser;
 
 const VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
-    " (Wanaku 1a22a9e692e2f50aed56913000be3def38a7ca2c with forward URL redaction backport)"
+    " (Wanaku 1a22a9e692e2f50aed56913000be3def38a7ca2c)"
 );
 
 const ASSEMBLY_ERROR: &str =

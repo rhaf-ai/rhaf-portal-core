@@ -1,5 +1,4 @@
 [workspace]
-exclude = ["vendor/wanaku/infra", "vendor/wanaku/server"]
 resolver = "3"
 members = [".", "xtask", "crates/rhaf-api"]
 default-members = [".", "crates/rhaf-api"]
@@ -45,7 +44,7 @@ thiserror = "2"
 tracing = "0.1.44"
 uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["macros", "sync", "time"] }
-# All Wanaku crates use the same base revision. The admin UI is disabled.
+# All Wanaku crates use the same pinned revision. The admin UI is disabled.
 wanaku-server = { git = "https://github.com/wanaku-ai/wanaku", rev = "1a22a9e692e2f50aed56913000be3def38a7ca2c", default-features = false }
 wanaku-infra = { git = "https://github.com/wanaku-ai/wanaku", rev = "1a22a9e692e2f50aed56913000be3def38a7ca2c" }
 wanaku-types = { git = "https://github.com/wanaku-ai/wanaku", rev = "1a22a9e692e2f50aed56913000be3def38a7ca2c" }
@@ -53,7 +52,6 @@ wanaku-feature-audit = { git = "https://github.com/wanaku-ai/wanaku", rev = "1a2
 wanaku-feature-evaluator = { git = "https://github.com/wanaku-ai/wanaku", rev = "1a22a9e692e2f50aed56913000be3def38a7ca2c" }
 
 [dev-dependencies]
-wiremock = "0.6"
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
 nix = { version = "0.32", default-features = false, features = ["signal", "process", "fs"] }
 toml = "1"
@@ -61,11 +59,6 @@ tokio = { version = "1", features = ["macros", "rt", "time"] }
 
 [lints]
 workspace = true
-
-# Apply the forward URL redaction backport documented in vendor/wanaku/README.md.
-[patch."https://github.com/wanaku-ai/wanaku"]
-wanaku-infra = { path = "vendor/wanaku/infra" }
-wanaku-server = { path = "vendor/wanaku/server" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

@@ -13,7 +13,6 @@ WORKDIR /src
 
 # Cache dependencies before copying application sources.
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
-COPY vendor/wanaku vendor/wanaku
 COPY xtask/Cargo.toml xtask/Cargo.toml
 # The contract crate generates OpenAPI during compilation.
 COPY crates/rhaf-api crates/rhaf-api
