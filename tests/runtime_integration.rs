@@ -7,6 +7,13 @@ use serde_json::json;
 use support::Harness;
 
 #[tokio::test]
+async fn forward_discovery_redacts_credential_bearing_urls() -> Result<()> {
+    Harness::management_only()?
+        .verify_forward_url_redaction()
+        .await
+}
+
+#[tokio::test]
 async fn management_wrapper_without_external_services() -> Result<()> {
     let harness = Harness::management_only()?;
     let core = harness.start_core("management.log").await?;

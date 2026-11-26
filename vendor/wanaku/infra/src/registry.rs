@@ -1,0 +1,2418 @@
+mod forward_publication;
+mod virtual_namespaces;
+
+use forward_publication::ForwardChanges;
+pub use forward_publication::{
+    DiscoveredForward, ForwardCapabilities, ForwardDiscoveryRequest, ForwardPublicationError,
+    PublishedCounts, PublishedForwardUpdate,
+};
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+use dashmap::DashMap;
+use wanaku_types::credentials::CredentialBinding;
+use wanaku_types::persistence::{PersistenceBackend, PersistenceError, RegistrySnapshot};
+use wanaku_types::registry::{
+    BindingRegistry, DEFAULT_NAMESPACE, ForwardEntry, ForwardRegistry, NamespaceEntry,
+    NamespaceRegistry, PromptEntry, PromptRegistry, ResourceEntry, ResourceRegistry, ToolEntry,
+    ToolRegistry, inject_request_id_arg,
+};
+
+/// Outcome of a remove operation guarded by a precondition.
+#[derive(Debug, Clone)]
+pub enum ConditionalRemoval<T> {
+    /// The entry existed, the precondition held, and the entry was removed.
+    Removed(T),
+    /// No entry exists with the given key.
+    NotFound,
+    /// The entry exists but the precondition failed. The entry was kept.
+    PreconditionFailed,
+}
+
+/// Registry key of a tool, resource, or prompt: `(namespace, name)`.
+type EntryKey = (String, String);
+
+fn entry_key(namespace: &str, name: &str) -> EntryKey {
+    (namespace.to_owned(), name.to_owned())
+}
+
+/// Set the default namespace on an entry without one and return its key.
+fn normalize_key(namespace: &mut Option<String>, name: &str) -> EntryKey {
+    let namespace = namespace.get_or_insert_with(|| DEFAULT_NAMESPACE.to_owned());
+    entry_key(namespace, name)
+}
+
+/// Insert `entry` unless another owner holds `key`. Returns the entry when it
+/// was skipped. Owners are compared by `forwardId`.
+fn insert_unless_taken<T>(
+    map: &DashMap<EntryKey, T>,
+    key: EntryKey,
+    entry: T,
+    owner: impl Fn(&T) -> Option<&str>,
+) -> Option<T> {
+    match map.entry(key) {
+        dashmap::mapref::entry::Entry::Occupied(occupied)
+            if owner(occupied.get()) != owner(&entry) =>
+        {
+            Some(entry)
+        }
+        dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+            occupied.insert(entry);
+            None
+        }
+        dashmap::mapref::entry::Entry::Vacant(vacant) => {
+            vacant.insert(entry);
+            None
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct InMemoryRegistry {
+    agents: Arc<DashMap<String, crate::agents::RegisteredAgent>>,
+    tools: Arc<DashMap<EntryKey, ToolEntry>>,
+    resources: Arc<DashMap<EntryKey, ResourceEntry>>,
+    prompts: Arc<DashMap<EntryKey, PromptEntry>>,
+    forwards: Arc<DashMap<String, ForwardEntry>>,
+    namespaces: Arc<DashMap<String, NamespaceEntry>>,
+    bindings: Arc<DashMap<String, CredentialBinding>>,
+    persistence: Option<PersistenceCoordinator>,
+    persistence_lock: Arc<Mutex<()>>,
+    namespace_lock: Arc<Mutex<ForwardChanges>>,
+    inject_request_id: Arc<AtomicBool>,
+}
+
+impl InMemoryRegistry {
+    pub fn new() -> Self {
+        let namespaces = DashMap::new();
+        namespaces.insert(
+            DEFAULT_NAMESPACE.to_owned(),
+            NamespaceEntry {
+                members: None,
+                name: DEFAULT_NAMESPACE.to_owned(),
+                labels: HashMap::new(),
+                auth_required: None,
+                audience: None,
+            },
+        );
+
+        Self {
+            agents: Arc::new(DashMap::new()),
+            tools: Arc::new(DashMap::new()),
+            resources: Arc::new(DashMap::new()),
+            prompts: Arc::new(DashMap::new()),
+            forwards: Arc::new(DashMap::new()),
+            namespaces: Arc::new(namespaces),
+            bindings: Arc::new(DashMap::new()),
+            persistence: None,
+            persistence_lock: Arc::new(Mutex::new(())),
+            namespace_lock: Arc::new(Mutex::new(ForwardChanges::default())),
+            inject_request_id: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn list_agents(&self) -> Vec<wanaku_types::agents::AgentEntry> {
+        self.agents
+            .iter()
+            .map(|agent| agent.entry.clone())
+            .collect()
+    }
+
+    pub fn get_agent(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Option<wanaku_types::agents::AgentEntry> {
+        self.agents
+            .get(&format!("{namespace}/{name}"))
+            .map(|agent| agent.entry.clone())
+    }
+
+    pub fn agent_endpoint(
+        &self,
+        namespace: &str,
+        name: &str,
+        card: bool,
+    ) -> Option<crate::agents::AgentEndpoint> {
+        self.agents
+            .get(&format!("{namespace}/{name}"))
+            .map(|agent| {
+                if card {
+                    agent.card.clone()
+                } else {
+                    agent.rpc.clone()
+                }
+            })
+    }
+
+    pub fn save_agent(
+        &self,
+        entry: wanaku_types::agents::AgentEntry,
+        update: bool,
+    ) -> Result<bool, String> {
+        let _guard = self.lock_namespaces();
+        self.validate_concrete_namespace(&entry.namespace)?;
+        let agent = crate::agents::RegisteredAgent::new(entry)?;
+        let namespace = agent.entry.namespace.clone();
+        let key = format!("{namespace}/{}", agent.entry.name);
+        match self.agents.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(mut occupied) if update => {
+                occupied.insert(agent);
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) if !update => {
+                vacant.insert(agent);
+            }
+            _ => return Ok(false),
+        }
+        self.namespaces
+            .entry(namespace.clone())
+            .or_insert_with(|| NamespaceEntry {
+                members: None,
+                name: namespace,
+                labels: HashMap::new(),
+                auth_required: None,
+                audience: None,
+            });
+        self.persist();
+        Ok(true)
+    }
+
+    pub fn remove_agent(&self, namespace: &str, name: &str) -> bool {
+        let removed = self.agents.remove(&format!("{namespace}/{name}")).is_some();
+        if removed {
+            self.persist();
+        }
+        removed
+    }
+
+    /// Remove an agent only when `predicate` holds for the stored entry.
+    ///
+    /// The check and the removal run under one map write lock, so a
+    /// concurrent update of the same agent cannot occur between them.
+    pub fn remove_agent_if(
+        &self,
+        namespace: &str,
+        name: &str,
+        predicate: impl FnOnce(&wanaku_types::agents::AgentEntry) -> bool,
+    ) -> ConditionalRemoval<wanaku_types::agents::AgentEntry> {
+        let outcome = match self.agents.entry(format!("{namespace}/{name}")) {
+            dashmap::mapref::entry::Entry::Occupied(occupied)
+                if predicate(&occupied.get().entry) =>
+            {
+                ConditionalRemoval::Removed(occupied.remove().entry)
+            }
+            dashmap::mapref::entry::Entry::Occupied(_) => ConditionalRemoval::PreconditionFailed,
+            dashmap::mapref::entry::Entry::Vacant(_) => ConditionalRemoval::NotFound,
+        };
+        if matches!(outcome, ConditionalRemoval::Removed(_)) {
+            self.persist();
+        }
+        outcome
+    }
+
+    /// Remove a forward and its discovered capabilities when the predicate
+    /// holds for the stored entry.
+    ///
+    /// The check and the removal run under one map write lock, so a
+    /// concurrent upsert of the same name cannot occur between them.
+    pub fn remove_forward_if(
+        &self,
+        name: &str,
+        predicate: impl FnOnce(&ForwardEntry) -> bool,
+    ) -> ConditionalRemoval<ForwardEntry> {
+        let mut changes = self.lock_namespaces();
+        let _persistence_guard = self.lock_persistence();
+        let outcome = match self.forwards.entry(name.to_owned()) {
+            dashmap::mapref::entry::Entry::Occupied(occupied) if predicate(occupied.get()) => {
+                ConditionalRemoval::Removed(occupied.remove())
+            }
+            dashmap::mapref::entry::Entry::Occupied(_) => ConditionalRemoval::PreconditionFailed,
+            dashmap::mapref::entry::Entry::Vacant(_) => ConditionalRemoval::NotFound,
+        };
+        if let ConditionalRemoval::Removed(forward) = &outcome {
+            changes.forwards.remove(name);
+            self.remove_forward_capabilities(forward.forward_id());
+            self.persist_locked();
+        }
+        outcome
+    }
+
+    /// Change a stored forward only when `predicate` holds for it.
+    ///
+    /// The check and the change run under one map write lock, so a concurrent
+    /// delete or upsert of the same name cannot occur between them. Returns
+    /// `true` when the forward was changed.
+    pub fn update_forward_if(
+        &self,
+        name: &str,
+        predicate: impl FnOnce(&ForwardEntry) -> bool,
+        update: impl FnOnce(&mut ForwardEntry),
+    ) -> bool {
+        let mut changes = self.lock_namespaces();
+        let updated = match self.forwards.get_mut(name) {
+            Some(mut stored) if predicate(&stored) => {
+                update(&mut stored);
+                true
+            }
+            _ => false,
+        };
+        if updated {
+            changes.forwards.remove(name);
+            self.persist();
+        }
+        updated
+    }
+
+    /// Change an unmanaged tool through the generic management API.
+    /// `None` removes the tool; `Some` sets its enabled state.
+    /// WASM bindings must be changed through the handler runtime.
+    pub fn mutate_unmanaged_tool(
+        &self,
+        namespace: &str,
+        name: &str,
+        enabled: Option<bool>,
+    ) -> Result<Option<ToolEntry>, String> {
+        let _guard = self.lock_namespaces();
+        let changed = match self.tools.entry(entry_key(namespace, name)) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                if entry.get().type_ == "wasm" {
+                    return Err(
+                        "tool is managed by /api/v1/tool-handlers; use handler management"
+                            .to_owned(),
+                    );
+                }
+                Some(match enabled {
+                    Some(enabled) => {
+                        entry.get_mut().enabled = enabled;
+                        entry.get().clone()
+                    }
+                    None => entry.remove(),
+                })
+            }
+            dashmap::mapref::entry::Entry::Vacant(_) => None,
+        };
+        if changed.is_some() {
+            self.persist();
+        }
+        Ok(changed)
+    }
+
+    /// Replace handler-owned tools after checking the current binding identities.
+    /// All checks complete before this operation changes the registry.
+    pub fn swap_handler_tools(
+        &self,
+        expected: &[ToolEntry],
+        replacement: Vec<ToolEntry>,
+    ) -> Result<(), String> {
+        self.swap_handler_tools_with(expected, replacement, || Ok(()))
+    }
+
+    /// Run persistence after ownership validation and before registry mutation.
+    /// The callback must not call registry mutation methods.
+    pub fn swap_handler_tools_with(
+        &self,
+        expected: &[ToolEntry],
+        replacement: Vec<ToolEntry>,
+        before_commit: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let _guard = self.lock_namespaces();
+        let expected: HashMap<_, _> = expected
+            .iter()
+            .cloned()
+            .map(|tool| self.normalize_handler_tool(tool))
+            .collect();
+        let next = self.prepare_handler_tools(replacement)?;
+        self.verify_handler_tools(&expected, &next)?;
+        before_commit()?;
+        for key in expected.keys() {
+            self.tools.remove(key);
+        }
+        for (key, tool) in next {
+            self.tools.insert(key, tool);
+        }
+        self.persist();
+        Ok(())
+    }
+
+    fn normalize_handler_tool(&self, mut tool: ToolEntry) -> (EntryKey, ToolEntry) {
+        let key = normalize_key(&mut tool.namespace, &tool.name);
+        if self.inject_request_id.load(Ordering::Relaxed) {
+            inject_request_id_arg(&mut tool.input_schema);
+        }
+        (key, tool)
+    }
+
+    fn prepare_handler_tools(
+        &self,
+        tools: Vec<ToolEntry>,
+    ) -> Result<HashMap<EntryKey, ToolEntry>, String> {
+        let mut next = HashMap::new();
+        for tool in tools {
+            let (key, tool) = self.normalize_handler_tool(tool);
+            self.validate_concrete_namespace(&key.0)?;
+            if tool.type_ != "wasm" || tool.forward_id.is_some() || tool.id.is_none() {
+                return Err(
+                    "handler tools require a binding id, type 'wasm', and no forwardId".to_owned(),
+                );
+            }
+            if next.insert(key, tool).is_some() {
+                return Err("duplicate handler identity".to_owned());
+            }
+        }
+        Ok(next)
+    }
+
+    fn verify_handler_tools(
+        &self,
+        expected: &HashMap<EntryKey, ToolEntry>,
+        next: &HashMap<EntryKey, ToolEntry>,
+    ) -> Result<(), String> {
+        for (key, prior) in expected {
+            match self.tools.get(key) {
+                Some(current)
+                    if prior.type_ != "wasm"
+                        || prior.id.is_none()
+                        || serde_json::to_value(current.value())
+                            .map_err(|error| error.to_string())?
+                            != serde_json::to_value(prior)
+                                .map_err(|error| error.to_string())? =>
+                {
+                    return Err(format!(
+                        "handler tool '{}/{}' changed outside its runtime",
+                        key.0, key.1
+                    ));
+                }
+                _ => {}
+            }
+        }
+        for key in next.keys() {
+            if self.tools.contains_key(key) && !expected.contains_key(key) {
+                return Err(format!(
+                    "tool '{}/{}' already belongs to another owner",
+                    key.0, key.1
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn enable_request_id_injection(&self) {
+        self.inject_request_id.store(true, Ordering::Relaxed);
+    }
+
+    pub fn with_persistence(backend: Arc<dyn PersistenceBackend>) -> Self {
+        Self {
+            persistence: Some(PersistenceCoordinator::start(backend)),
+            ..Self::new()
+        }
+    }
+
+    /// Load all entries from the persistence backend into memory.
+    ///
+    /// Inserts directly into the DashMaps to avoid triggering
+    /// `persist()` on every entry (the data already came from disk).
+    #[expect(
+        clippy::too_many_lines,
+        reason = "sequential loading of all registry types"
+    )]
+    pub fn load_persisted(&self) {
+        let Some(persistence) = &self.persistence else {
+            return;
+        };
+
+        let snapshot = match persistence.backend.load() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to load persisted registry");
+                return;
+            }
+        };
+
+        let mut changes = self.lock_namespaces();
+        if let Err(error) = self.validate_snapshot_namespaces(&snapshot) {
+            tracing::error!(%error, "invalid persisted namespace graph; snapshot was not loaded");
+            return;
+        }
+
+        for agent in snapshot.agents {
+            match crate::agents::RegisteredAgent::new(agent) {
+                Ok(agent) => {
+                    let namespace = agent.entry.namespace.clone();
+                    self.namespaces
+                        .entry(namespace.clone())
+                        .or_insert_with(|| NamespaceEntry {
+                            members: None,
+                            name: namespace,
+                            labels: HashMap::new(),
+                            auth_required: None,
+                            audience: None,
+                        });
+                    self.agents.insert(
+                        format!("{}/{}", agent.entry.namespace, agent.entry.name),
+                        agent,
+                    );
+                }
+                Err(error) => tracing::warn!(%error, "invalid persisted agent skipped"),
+            }
+        }
+        // Snapshots store entries as lists, so snapshots written before entries
+        // were keyed by namespace load unchanged. An entry without a namespace
+        // goes to the default namespace.
+        for mut tool in snapshot.tools {
+            let key = normalize_key(&mut tool.namespace, &tool.name);
+            inject_request_id_arg(&mut tool.input_schema);
+            self.tools.insert(key, tool);
+        }
+        for mut resource in snapshot.resources {
+            let key = normalize_key(&mut resource.namespace, &resource.name);
+            self.resources.insert(key, resource);
+        }
+        for mut prompt in snapshot.prompts {
+            let key = normalize_key(&mut prompt.namespace, &prompt.name);
+            self.prompts.insert(key, prompt);
+        }
+        for namespace in snapshot.namespaces {
+            self.namespaces.insert(namespace.name.clone(), namespace);
+        }
+        for forward in snapshot.forwards {
+            changes.forwards.remove(&forward.name);
+            self.insert_forward(forward);
+        }
+        for binding in snapshot.bindings {
+            changes.bindings.remove(&binding.id);
+            self.bindings.insert(binding.id.clone(), binding);
+        }
+
+        tracing::info!("loaded registry from persistence backend");
+    }
+
+    fn snapshot(&self) -> RegistrySnapshot {
+        RegistrySnapshot {
+            agents: self.list_agents(),
+            tools: self.list_tools(),
+            resources: self.list_resources(),
+            prompts: self.list_prompts(),
+            forwards: self.list_forwards(),
+            namespaces: self.list_namespaces(),
+            bindings: self.list_bindings(),
+        }
+    }
+
+    fn persist(&self) {
+        let _guard = self.lock_persistence();
+        self.persist_locked();
+    }
+
+    fn lock_persistence(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        self.persistence.as_ref().map(|_| {
+            self.persistence_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        })
+    }
+
+    fn persist_locked(&self) {
+        if let Some(persistence) = &self.persistence {
+            let snapshot = self.snapshot();
+            if let Err(error) = persistence.enqueue(snapshot) {
+                tracing::warn!(error = %error, "failed to queue registry persistence");
+            }
+        }
+    }
+
+    /// Wait for registry snapshots submitted before this call to persist.
+    ///
+    /// The wait is bounded by `timeout`. This method is intended for orderly
+    /// shutdown and tests; regular registry mutations remain non-blocking.
+    pub fn flush_persistence(&self, timeout: Duration) -> Result<(), PersistenceError> {
+        self.persistence
+            .as_ref()
+            .map_or(Ok(()), |persistence| persistence.flush(timeout))
+    }
+
+    /// Return a small, non-sensitive view of registry persistence progress.
+    #[must_use]
+    pub fn persistence_status(&self) -> RegistryPersistenceStatus {
+        self.persistence.as_ref().map_or_else(
+            || RegistryPersistenceStatus {
+                enabled: false,
+                pending: false,
+                last_successful_generation: None,
+                last_error: None,
+            },
+            PersistenceCoordinator::status,
+        )
+    }
+
+    fn insert_forward(&self, mut forward: ForwardEntry) {
+        let namespace = forward
+            .namespace
+            .clone()
+            .unwrap_or_else(|| DEFAULT_NAMESPACE.to_owned());
+        forward.namespace = Some(namespace.clone());
+
+        if let Err(reason) = wanaku_types::registry::validate_namespace_name(&namespace) {
+            tracing::warn!(
+                forward = %forward.name,
+                namespace = %namespace,
+                error = %reason,
+                "forward references an invalid namespace name; skipping namespace auto-registration"
+            );
+        } else {
+            self.namespaces
+                .entry(namespace.clone())
+                .or_insert_with(|| NamespaceEntry {
+                    members: None,
+                    name: namespace,
+                    labels: HashMap::new(),
+                    auth_required: None,
+                    audience: None,
+                });
+        }
+
+        self.forwards.insert(forward.name.clone(), forward);
+    }
+}
+
+/// Non-sensitive registry persistence state for health and shutdown handling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryPersistenceStatus {
+    pub enabled: bool,
+    pub pending: bool,
+    pub last_successful_generation: Option<u64>,
+    pub last_error: Option<String>,
+}
+
+struct PersistenceCoordinator {
+    backend: Arc<dyn PersistenceBackend>,
+    shared: Arc<PersistenceShared>,
+    join: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+}
+
+struct PersistenceShared {
+    state: Mutex<PersistenceState>,
+    ready: Condvar,
+    completed: Condvar,
+}
+
+struct PersistenceState {
+    pending: Option<PendingSnapshot>,
+    next_generation: u64,
+    completed_generation: u64,
+    last_successful_generation: Option<u64>,
+    last_error: Option<PersistenceFailure>,
+    producers: usize,
+}
+
+struct PendingSnapshot {
+    generation: u64,
+    snapshot: RegistrySnapshot,
+}
+
+struct PersistenceFailure {
+    generation: u64,
+    message: String,
+}
+
+const REGISTRY_PERSISTENCE_ERROR: &str = "registry persistence unavailable";
+
+impl PersistenceCoordinator {
+    fn start(backend: Arc<dyn PersistenceBackend>) -> Self {
+        let shared = Arc::new(PersistenceShared {
+            state: Mutex::new(PersistenceState {
+                pending: None,
+                next_generation: 0,
+                completed_generation: 0,
+                last_successful_generation: None,
+                last_error: None,
+                producers: 1,
+            }),
+            ready: Condvar::new(),
+            completed: Condvar::new(),
+        });
+        let worker_shared = Arc::clone(&shared);
+        let worker_backend = Arc::clone(&backend);
+        let join = match std::thread::Builder::new()
+            .name("wanaku-registry-persistence".to_owned())
+            .spawn(move || persistence_loop(&worker_shared, &worker_backend))
+        {
+            Ok(join) => Some(join),
+            Err(error) => {
+                let mut state = lock_state(&shared);
+                state.last_error = Some(PersistenceFailure {
+                    generation: 0,
+                    message: error.to_string(),
+                });
+                None
+            }
+        };
+        Self {
+            backend,
+            shared,
+            join: Arc::new(Mutex::new(join)),
+        }
+    }
+
+    fn enqueue(&self, snapshot: RegistrySnapshot) -> Result<(), PersistenceError> {
+        let worker_available = match self.join.lock() {
+            Ok(join) => join.is_some(),
+            Err(error) => error.into_inner().is_some(),
+        };
+        if !worker_available {
+            return Err(PersistenceError::Coordination(
+                "registry persistence worker is unavailable".to_owned(),
+            ));
+        }
+        let mut state = lock_state(&self.shared);
+        state.next_generation = state.next_generation.saturating_add(1);
+        let generation = state.next_generation;
+        state.pending = Some(PendingSnapshot {
+            generation,
+            snapshot,
+        });
+        self.shared.ready.notify_one();
+        Ok(())
+    }
+
+    fn flush(&self, timeout: Duration) -> Result<(), PersistenceError> {
+        let deadline = Instant::now() + timeout;
+        let mut state = lock_state(&self.shared);
+        let target_generation = state.next_generation;
+        while state.completed_generation < target_generation {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(PersistenceError::Coordination(
+                    "timed out waiting for registry persistence".to_owned(),
+                ));
+            }
+            let wait = self.shared.completed.wait_timeout(state, remaining);
+            state = match wait {
+                Ok((state, _)) => state,
+                Err(error) => error.into_inner().0,
+            };
+        }
+        if let Some(error) = &state.last_error
+            && error.generation >= target_generation
+        {
+            return Err(PersistenceError::Coordination(error.message.clone()));
+        }
+        Ok(())
+    }
+
+    fn status(&self) -> RegistryPersistenceStatus {
+        let state = lock_state(&self.shared);
+        RegistryPersistenceStatus {
+            enabled: true,
+            pending: state.pending.is_some() || state.completed_generation < state.next_generation,
+            last_successful_generation: state.last_successful_generation,
+            last_error: state
+                .last_error
+                .as_ref()
+                .map(|_| REGISTRY_PERSISTENCE_ERROR.to_owned()),
+        }
+    }
+
+    fn add_producer(&self) {
+        let mut state = lock_state(&self.shared);
+        state.producers = state.producers.saturating_add(1);
+    }
+}
+
+impl Clone for PersistenceCoordinator {
+    fn clone(&self) -> Self {
+        self.add_producer();
+        Self {
+            backend: Arc::clone(&self.backend),
+            shared: Arc::clone(&self.shared),
+            join: Arc::clone(&self.join),
+        }
+    }
+}
+
+impl Drop for PersistenceCoordinator {
+    fn drop(&mut self) {
+        let last_producer = {
+            let mut state = lock_state(&self.shared);
+            state.producers = state.producers.saturating_sub(1);
+            state.producers == 0
+        };
+        self.shared.ready.notify_one();
+        if !last_producer {
+            return;
+        }
+        let join = match self.join.lock() {
+            Ok(mut join) => join.take(),
+            Err(error) => error.into_inner().take(),
+        };
+        drop(join);
+    }
+}
+
+fn persistence_loop(shared: &PersistenceShared, backend: &Arc<dyn PersistenceBackend>) {
+    while let Some(pending) = next_pending_snapshot(shared) {
+        let result = backend.save(&pending.snapshot);
+        let mut state = lock_state(shared);
+        state.completed_generation = state.completed_generation.max(pending.generation);
+        match result {
+            Ok(()) => {
+                state.last_successful_generation = Some(pending.generation);
+                state.last_error = None;
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to persist registry");
+                state.last_error = Some(PersistenceFailure {
+                    generation: pending.generation,
+                    message: error.to_string(),
+                });
+            }
+        }
+        shared.completed.notify_all();
+    }
+}
+
+fn next_pending_snapshot(shared: &PersistenceShared) -> Option<PendingSnapshot> {
+    let mut state = lock_state(shared);
+    while state.pending.is_none() && state.producers > 0 {
+        state = match shared.ready.wait(state) {
+            Ok(state) => state,
+            Err(error) => error.into_inner(),
+        };
+    }
+    state.pending.take()
+}
+
+fn lock_state(shared: &PersistenceShared) -> std::sync::MutexGuard<'_, PersistenceState> {
+    match shared.state.lock() {
+        Ok(state) => state,
+        Err(error) => error.into_inner(),
+    }
+}
+
+impl Default for InMemoryRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ToolRegistry for InMemoryRegistry {
+    fn list_tools(&self) -> Vec<ToolEntry> {
+        self.tools
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect()
+    }
+
+    fn list_tools_in_namespace(&self, namespace: &str) -> Vec<ToolEntry> {
+        match namespace.strip_prefix("virtual-ns/") {
+            Some(name) => self.virtual_tools(name),
+            None => self
+                .tools
+                .iter()
+                .filter(|entry| entry.value().enabled && entry.key().0 == namespace)
+                .map(|entry| entry.value().clone())
+                .collect(),
+        }
+    }
+
+    fn get_tool(&self, namespace: &str, name: &str) -> Option<ToolEntry> {
+        self.tools
+            .get(&entry_key(namespace, name))
+            .map(|entry| entry.value().clone())
+    }
+
+    fn get_tool_in_namespace(&self, namespace: &str, name: &str) -> Option<ToolEntry> {
+        self.get_tool(namespace, name).filter(|tool| tool.enabled)
+    }
+
+    fn register_tool(&self, tool: ToolEntry) {
+        self.register_tools_batch(vec![tool]);
+    }
+
+    fn register_tools_batch(&self, tools: Vec<ToolEntry>) {
+        if tools.is_empty() {
+            return;
+        }
+        let inject = self.inject_request_id.load(Ordering::Relaxed);
+        let _guard = self.lock_namespaces();
+        for mut tool in tools {
+            if !self.accept_entry_namespace(tool.namespace.as_deref()) {
+                continue;
+            }
+            let key = normalize_key(&mut tool.namespace, &tool.name);
+            if inject {
+                inject_request_id_arg(&mut tool.input_schema);
+            }
+            self.tools.insert(key, tool);
+        }
+        self.persist();
+    }
+
+    fn register_tools_unless_taken(&self, tools: Vec<ToolEntry>) -> Vec<ToolEntry> {
+        if tools.is_empty() {
+            return Vec::new();
+        }
+        let inject = self.inject_request_id.load(Ordering::Relaxed);
+        let mut skipped = Vec::new();
+        let _guard = self.lock_namespaces();
+        for mut tool in tools {
+            if !self.accept_entry_namespace(tool.namespace.as_deref()) {
+                skipped.push(tool);
+                continue;
+            }
+            let key = normalize_key(&mut tool.namespace, &tool.name);
+            if inject {
+                inject_request_id_arg(&mut tool.input_schema);
+            }
+            skipped.extend(insert_unless_taken(&self.tools, key, tool, |e| {
+                e.forward_id.as_deref()
+            }));
+        }
+        self.persist();
+        skipped
+    }
+
+    fn remove_tool(&self, namespace: &str, name: &str) -> bool {
+        let _guard = self.lock_namespaces();
+        let removed = self.tools.remove(&entry_key(namespace, name)).is_some();
+        if removed {
+            self.persist();
+        }
+        removed
+    }
+
+    fn set_tool_enabled(&self, namespace: &str, name: &str, enabled: bool) -> bool {
+        let _guard = self.lock_namespaces();
+        let Some(mut entry) = self.tools.get_mut(&entry_key(namespace, name)) else {
+            return false;
+        };
+        entry.enabled = enabled;
+        // Release the shard lock before persist() iterates the map.
+        drop(entry);
+        self.persist();
+        true
+    }
+
+    fn remove_tools_owned_by(&self, forward_id: &str) -> usize {
+        let _guard = self.lock_namespaces();
+        let mut count = 0;
+        self.tools.retain(|_, entry| {
+            let owned = entry.forward_id.as_deref() == Some(forward_id);
+            count += usize::from(owned);
+            !owned
+        });
+        if count > 0 {
+            self.persist();
+        }
+        count
+    }
+
+    fn tool_count(&self) -> usize {
+        self.tools.len()
+    }
+}
+
+impl ResourceRegistry for InMemoryRegistry {
+    fn list_resources(&self) -> Vec<ResourceEntry> {
+        self.resources
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect()
+    }
+
+    fn list_resources_in_namespace(&self, namespace: &str) -> Vec<ResourceEntry> {
+        match namespace.strip_prefix("virtual-ns/") {
+            Some(name) => self.virtual_resources(name),
+            None => self
+                .resources
+                .iter()
+                .filter(|entry| entry.value().enabled && entry.key().0 == namespace)
+                .map(|entry| entry.value().clone())
+                .collect(),
+        }
+    }
+
+    fn get_resource(&self, namespace: &str, name: &str) -> Option<ResourceEntry> {
+        self.resources
+            .get(&entry_key(namespace, name))
+            .map(|entry| entry.value().clone())
+    }
+
+    fn get_resource_in_namespace(&self, namespace: &str, name: &str) -> Option<ResourceEntry> {
+        self.get_resource(namespace, name)
+            .filter(|resource| resource.enabled)
+    }
+
+    fn register_resource(&self, resource: ResourceEntry) {
+        self.register_resources_batch(vec![resource]);
+    }
+
+    fn register_resources_batch(&self, resources: Vec<ResourceEntry>) {
+        if resources.is_empty() {
+            return;
+        }
+        let _guard = self.lock_namespaces();
+        for mut resource in resources {
+            if !self.accept_entry_namespace(resource.namespace.as_deref()) {
+                continue;
+            }
+            let key = normalize_key(&mut resource.namespace, &resource.name);
+            self.resources.insert(key, resource);
+        }
+        self.persist();
+    }
+
+    fn register_resources_unless_taken(&self, resources: Vec<ResourceEntry>) -> Vec<ResourceEntry> {
+        if resources.is_empty() {
+            return Vec::new();
+        }
+        let mut skipped = Vec::new();
+        let _guard = self.lock_namespaces();
+        for mut resource in resources {
+            if !self.accept_entry_namespace(resource.namespace.as_deref()) {
+                skipped.push(resource);
+                continue;
+            }
+            let key = normalize_key(&mut resource.namespace, &resource.name);
+            skipped.extend(insert_unless_taken(&self.resources, key, resource, |e| {
+                e.forward_id.as_deref()
+            }));
+        }
+        self.persist();
+        skipped
+    }
+
+    fn remove_resource(&self, namespace: &str, name: &str) -> bool {
+        let _guard = self.lock_namespaces();
+        let removed = self.resources.remove(&entry_key(namespace, name)).is_some();
+        if removed {
+            self.persist();
+        }
+        removed
+    }
+
+    fn set_resource_enabled(&self, namespace: &str, name: &str, enabled: bool) -> bool {
+        let _guard = self.lock_namespaces();
+        let Some(mut entry) = self.resources.get_mut(&entry_key(namespace, name)) else {
+            return false;
+        };
+        entry.enabled = enabled;
+        // Release the shard lock before persist() iterates the map.
+        drop(entry);
+        self.persist();
+        true
+    }
+
+    fn remove_resources_owned_by(&self, forward_id: &str) -> usize {
+        let _guard = self.lock_namespaces();
+        let mut count = 0;
+        self.resources.retain(|_, entry| {
+            let owned = entry.forward_id.as_deref() == Some(forward_id);
+            count += usize::from(owned);
+            !owned
+        });
+        if count > 0 {
+            self.persist();
+        }
+        count
+    }
+
+    fn resource_count(&self) -> usize {
+        self.resources.len()
+    }
+}
+
+impl PromptRegistry for InMemoryRegistry {
+    fn list_prompts(&self) -> Vec<PromptEntry> {
+        self.prompts
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect()
+    }
+
+    fn list_prompts_in_namespace(&self, namespace: &str) -> Vec<PromptEntry> {
+        match namespace.strip_prefix("virtual-ns/") {
+            Some(name) => self.virtual_prompts(name),
+            None => self
+                .prompts
+                .iter()
+                .filter(|entry| entry.value().enabled && entry.key().0 == namespace)
+                .map(|entry| entry.value().clone())
+                .collect(),
+        }
+    }
+
+    fn get_prompt(&self, namespace: &str, name: &str) -> Option<PromptEntry> {
+        self.prompts
+            .get(&entry_key(namespace, name))
+            .map(|entry| entry.value().clone())
+    }
+
+    fn get_prompt_in_namespace(&self, namespace: &str, name: &str) -> Option<PromptEntry> {
+        self.get_prompt(namespace, name)
+            .filter(|prompt| prompt.enabled)
+    }
+
+    fn register_prompt(&self, prompt: PromptEntry) {
+        self.register_prompts_batch(vec![prompt]);
+    }
+
+    fn register_prompts_batch(&self, prompts: Vec<PromptEntry>) {
+        if prompts.is_empty() {
+            return;
+        }
+        let _guard = self.lock_namespaces();
+        for mut prompt in prompts {
+            if !self.accept_entry_namespace(prompt.namespace.as_deref()) {
+                continue;
+            }
+            let key = normalize_key(&mut prompt.namespace, &prompt.name);
+            self.prompts.insert(key, prompt);
+        }
+        self.persist();
+    }
+
+    fn register_prompts_unless_taken(&self, prompts: Vec<PromptEntry>) -> Vec<PromptEntry> {
+        if prompts.is_empty() {
+            return Vec::new();
+        }
+        let mut skipped = Vec::new();
+        let _guard = self.lock_namespaces();
+        for mut prompt in prompts {
+            if !self.accept_entry_namespace(prompt.namespace.as_deref()) {
+                skipped.push(prompt);
+                continue;
+            }
+            let key = normalize_key(&mut prompt.namespace, &prompt.name);
+            skipped.extend(insert_unless_taken(&self.prompts, key, prompt, |e| {
+                e.forward_id.as_deref()
+            }));
+        }
+        self.persist();
+        skipped
+    }
+
+    fn remove_prompt(&self, namespace: &str, name: &str) -> bool {
+        let _guard = self.lock_namespaces();
+        let removed = self.prompts.remove(&entry_key(namespace, name)).is_some();
+        if removed {
+            self.persist();
+        }
+        removed
+    }
+
+    fn set_prompt_enabled(&self, namespace: &str, name: &str, enabled: bool) -> bool {
+        let _guard = self.lock_namespaces();
+        let Some(mut entry) = self.prompts.get_mut(&entry_key(namespace, name)) else {
+            return false;
+        };
+        entry.enabled = enabled;
+        // Release the shard lock before persist() iterates the map.
+        drop(entry);
+        self.persist();
+        true
+    }
+
+    fn remove_prompts_owned_by(&self, forward_id: &str) -> usize {
+        let _guard = self.lock_namespaces();
+        let mut count = 0;
+        self.prompts.retain(|_, entry| {
+            let owned = entry.forward_id.as_deref() == Some(forward_id);
+            count += usize::from(owned);
+            !owned
+        });
+        if count > 0 {
+            self.persist();
+        }
+        count
+    }
+
+    fn prompt_count(&self) -> usize {
+        self.prompts.len()
+    }
+}
+
+impl NamespaceRegistry for InMemoryRegistry {
+    fn list_namespaces(&self) -> Vec<NamespaceEntry> {
+        self.namespaces
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect()
+    }
+
+    fn get_namespace(&self, name: &str) -> Option<NamespaceEntry> {
+        self.namespaces.get(name).map(|entry| entry.value().clone())
+    }
+
+    fn register_namespace(&self, namespace: NamespaceEntry) {
+        if let Err(error) = self.try_register_namespace(namespace) {
+            tracing::warn!(%error, "namespace registration rejected");
+        }
+    }
+
+    fn remove_namespace(&self, name: &str) -> bool {
+        match self.try_remove_namespace(name) {
+            Ok(removed) => removed,
+            Err(error) => {
+                tracing::warn!(%error, "namespace removal rejected");
+                false
+            }
+        }
+    }
+}
+
+impl ForwardRegistry for InMemoryRegistry {
+    fn list_forwards(&self) -> Vec<ForwardEntry> {
+        self.forwards
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect()
+    }
+
+    fn get_forward(&self, name: &str) -> Option<ForwardEntry> {
+        self.forwards.get(name).map(|entry| entry.value().clone())
+    }
+
+    fn register_forward(&self, forward: ForwardEntry) {
+        if let Err(error) = self.try_register_forward(forward) {
+            tracing::warn!(%error, "forward registration rejected");
+        }
+    }
+
+    fn remove_forward(&self, name: &str) -> bool {
+        matches!(
+            self.remove_forward_if(name, |_| true),
+            ConditionalRemoval::Removed(_)
+        )
+    }
+}
+
+impl BindingRegistry for InMemoryRegistry {
+    fn list_bindings(&self) -> Vec<CredentialBinding> {
+        self.bindings
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect()
+    }
+
+    fn list_bindings_for_forward(&self, forward_id: &str) -> Vec<CredentialBinding> {
+        self.bindings
+            .iter()
+            .filter(|entry| entry.value().forward_id == forward_id)
+            .map(|entry| entry.value().clone())
+            .collect()
+    }
+
+    fn get_binding(&self, id: &str) -> Option<CredentialBinding> {
+        self.bindings.get(id).map(|entry| entry.value().clone())
+    }
+
+    fn register_binding(&self, mut binding: CredentialBinding) {
+        let mut changes = self.lock_namespaces();
+        // Keep the revision monotonic per binding id. Any change to the stored
+        // content bumps the revision so cached credentials keyed by the old
+        // revision are never reused. Identical re-registration keeps the
+        // revision unchanged.
+        if let Some(existing) = self.bindings.get(&binding.id) {
+            let mut probe = binding.clone();
+            probe.revision = existing.revision;
+            binding.revision = if probe == *existing.value() {
+                existing.revision
+            } else {
+                existing.revision.saturating_add(1)
+            };
+        }
+        changes.bindings.remove(&binding.id);
+        self.bindings.insert(binding.id.clone(), binding);
+        self.persist();
+    }
+
+    fn remove_binding(&self, id: &str) -> bool {
+        let mut changes = self.lock_namespaces();
+        let removed = self.bindings.remove(id).is_some();
+        if removed {
+            changes.bindings.remove(id);
+            self.persist();
+        }
+        removed
+    }
+
+    fn binding_count(&self) -> usize {
+        self.bindings.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_tool() -> ToolEntry {
+        ToolEntry {
+            name: "test-tool".to_owned(),
+            description: "A test tool".to_owned(),
+            uri: "camel:http://example.com".to_owned(),
+            type_: "http".to_owned(),
+            mcp: Default::default(),
+            input_schema: serde_json::json!({"type": "object"}),
+            labels: HashMap::new(),
+            id: None,
+            namespace: None,
+            forward_id: None,
+            enabled: true,
+        }
+    }
+
+    fn sample_resource() -> ResourceEntry {
+        ResourceEntry {
+            name: "test-resource".to_owned(),
+            description: "A test resource".to_owned(),
+            location: "/tmp/test.txt".to_owned(),
+            type_: "file".to_owned(),
+            mime_type: "text/plain".to_owned(),
+            labels: HashMap::new(),
+            id: None,
+            namespace: None,
+            forward_id: None,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn register_and_list_tools() {
+        let registry = InMemoryRegistry::new();
+        registry.register_tool(sample_tool());
+        let tools = registry.list_tools();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "test-tool");
+    }
+
+    #[test]
+    fn get_tool_by_name() {
+        let registry = InMemoryRegistry::new();
+        registry.register_tool(sample_tool());
+        let tool = registry.get_tool(DEFAULT_NAMESPACE, "test-tool");
+        assert!(tool.is_some());
+        assert_eq!(
+            tool.as_ref().map(|t| t.uri.as_str()),
+            Some("camel:http://example.com")
+        );
+    }
+
+    #[test]
+    fn get_missing_tool_returns_none() {
+        let registry = InMemoryRegistry::new();
+        assert!(
+            registry
+                .get_tool(DEFAULT_NAMESPACE, "nonexistent")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn remove_tool() {
+        let registry = InMemoryRegistry::new();
+        registry.register_tool(sample_tool());
+        assert!(registry.remove_tool(DEFAULT_NAMESPACE, "test-tool"));
+        assert!(registry.get_tool(DEFAULT_NAMESPACE, "test-tool").is_none());
+    }
+
+    #[test]
+    fn disabled_tool_is_hidden_from_namespace_lookups() {
+        let registry = InMemoryRegistry::new();
+        registry.register_tool(sample_tool());
+
+        assert!(registry.set_tool_enabled(DEFAULT_NAMESPACE, "test-tool", false));
+        assert!(
+            registry
+                .list_tools_in_namespace(DEFAULT_NAMESPACE)
+                .is_empty()
+        );
+        assert!(
+            registry
+                .get_tool_in_namespace(DEFAULT_NAMESPACE, "test-tool")
+                .is_none()
+        );
+        let listed = registry.list_tools();
+        assert_eq!(listed.len(), 1);
+        assert!(!listed[0].enabled);
+
+        assert!(registry.set_tool_enabled(DEFAULT_NAMESPACE, "test-tool", true));
+        assert_eq!(registry.list_tools_in_namespace(DEFAULT_NAMESPACE).len(), 1);
+        assert!(
+            registry
+                .get_tool_in_namespace(DEFAULT_NAMESPACE, "test-tool")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn set_enabled_on_missing_entry_returns_false() {
+        let registry = InMemoryRegistry::new();
+        assert!(!registry.set_tool_enabled(DEFAULT_NAMESPACE, "missing", false));
+        assert!(!registry.set_resource_enabled(DEFAULT_NAMESPACE, "missing", false));
+        assert!(!registry.set_prompt_enabled(DEFAULT_NAMESPACE, "missing", false));
+    }
+
+    fn handler_tool(binding: &str) -> ToolEntry {
+        ToolEntry {
+            type_: "wasm".to_owned(),
+            id: Some(binding.to_owned()),
+            ..sample_tool()
+        }
+    }
+
+    #[test]
+    fn generic_tool_mutation_preserves_handler_bindings() {
+        let registry = InMemoryRegistry::new();
+        let tool = handler_tool("managed-binding");
+        registry.register_tool(tool.clone());
+        for enabled in [Some(false), None] {
+            assert!(
+                registry
+                    .mutate_unmanaged_tool(DEFAULT_NAMESPACE, &tool.name, enabled)
+                    .is_err()
+            );
+        }
+        assert!(
+            registry
+                .get_tool(DEFAULT_NAMESPACE, &tool.name)
+                .is_some_and(|entry| entry.enabled && entry.id == tool.id)
+        );
+    }
+
+    #[test]
+    fn generic_tool_mutation_changes_unmanaged_entries() -> Result<(), String> {
+        let registry = InMemoryRegistry::new();
+        let tool = sample_tool();
+        registry.register_tool(tool.clone());
+        let disabled =
+            registry.mutate_unmanaged_tool(DEFAULT_NAMESPACE, &tool.name, Some(false))?;
+        assert!(disabled.is_some_and(|tool| !tool.enabled));
+        assert!(
+            registry
+                .mutate_unmanaged_tool(DEFAULT_NAMESPACE, &tool.name, None)?
+                .is_some()
+        );
+        assert!(registry.get_tool(DEFAULT_NAMESPACE, &tool.name).is_none());
+        assert!(
+            registry
+                .mutate_unmanaged_tool(DEFAULT_NAMESPACE, "absent", None)?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn handler_swap_keeps_current_binding_when_persistence_fails() -> Result<(), String> {
+        let registry = InMemoryRegistry::new();
+        registry.enable_request_id_injection();
+        let first = handler_tool("binding-1");
+        registry.swap_handler_tools(&[], vec![first.clone()])?;
+        let swap =
+            registry.swap_handler_tools_with(std::slice::from_ref(&first), Vec::new(), || {
+                Err("disk full".to_owned())
+            });
+        assert!(swap.is_err());
+        assert_eq!(
+            registry
+                .get_tool(DEFAULT_NAMESPACE, &first.name)
+                .and_then(|tool| tool.id),
+            first.id
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn handler_swap_rejects_stale_bindings_without_changes() -> Result<(), String> {
+        let registry = InMemoryRegistry::new();
+        registry.enable_request_id_injection();
+        let first = handler_tool("binding-1");
+        registry.swap_handler_tools(&[], vec![first.clone()])?;
+        let replacement = handler_tool("binding-2");
+        registry.swap_handler_tools(std::slice::from_ref(&first), vec![replacement.clone()])?;
+        assert!(
+            registry
+                .swap_handler_tools(std::slice::from_ref(&first), Vec::new())
+                .is_err()
+        );
+        assert_eq!(
+            registry
+                .get_tool(DEFAULT_NAMESPACE, &first.name)
+                .and_then(|tool| tool.id),
+            replacement.id
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn handler_swap_rejects_foreign_owners_without_changes() -> Result<(), String> {
+        let registry = InMemoryRegistry::new();
+        let replacement = handler_tool("binding-1");
+        registry.swap_handler_tools(&[], vec![replacement.clone()])?;
+        let mut foreign = owned_tool(&replacement.name, DEFAULT_NAMESPACE, "foreign");
+        foreign.type_ = "mcp-forward".to_owned();
+        registry.register_tool(foreign);
+        assert!(
+            registry
+                .swap_handler_tools(std::slice::from_ref(&replacement), Vec::new())
+                .is_err()
+        );
+        assert!(
+            registry
+                .swap_handler_tools(&[], vec![replacement.clone()])
+                .is_err()
+        );
+        assert_eq!(
+            registry
+                .get_tool(DEFAULT_NAMESPACE, &replacement.name)
+                .and_then(|tool| tool.forward_id)
+                .as_deref(),
+            Some("foreign")
+        );
+        Ok(())
+    }
+
+    fn owned_tool(name: &str, namespace: &str, forward_id: &str) -> ToolEntry {
+        ToolEntry {
+            name: name.to_owned(),
+            namespace: Some(namespace.to_owned()),
+            forward_id: Some(forward_id.to_owned()),
+            ..sample_tool()
+        }
+    }
+
+    #[test]
+    fn same_name_in_two_namespaces_keeps_both_entries() {
+        let registry = InMemoryRegistry::new();
+        registry.register_tool(owned_tool("echo", "default", "a"));
+        registry.register_tool(owned_tool("echo", "other", "b"));
+
+        assert_eq!(registry.tool_count(), 2);
+        let in_default = registry.get_tool_in_namespace("default", "echo");
+        let in_other = registry.get_tool_in_namespace("other", "echo");
+        assert_eq!(in_default.and_then(|t| t.forward_id).as_deref(), Some("a"));
+        assert_eq!(in_other.and_then(|t| t.forward_id).as_deref(), Some("b"));
+        assert_eq!(registry.list_tools_in_namespace("default").len(), 1);
+        assert_eq!(registry.list_tools_in_namespace("other").len(), 1);
+        assert!(registry.get_tool("missing-ns", "echo").is_none());
+
+        assert!(registry.set_tool_enabled("other", "echo", false));
+        assert!(registry.get_tool_in_namespace("other", "echo").is_none());
+        assert!(registry.get_tool_in_namespace("default", "echo").is_some());
+
+        assert!(registry.remove_tool("other", "echo"));
+        assert!(registry.get_tool("default", "echo").is_some());
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "covers skip, replacement, and local owners"
+    )]
+    fn register_unless_taken_keeps_the_entry_of_another_owner() {
+        let registry = InMemoryRegistry::new();
+        registry.register_tool(owned_tool("echo", "default", "a"));
+
+        let skipped = registry.register_tools_unless_taken(vec![
+            owned_tool("echo", "default", "b"),
+            owned_tool("echo", "other", "b"),
+            owned_tool("only-b", "default", "b"),
+        ]);
+
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].forward_id.as_deref(), Some("b"));
+        assert_eq!(
+            registry
+                .get_tool("default", "echo")
+                .and_then(|t| t.forward_id)
+                .as_deref(),
+            Some("a")
+        );
+        assert!(registry.get_tool("other", "echo").is_some());
+        assert!(registry.get_tool("default", "only-b").is_some());
+
+        // The same owner replaces its own entry.
+        let mut updated = owned_tool("echo", "default", "a");
+        updated.description = "updated".to_owned();
+        assert!(
+            registry
+                .register_tools_unless_taken(vec![updated])
+                .is_empty()
+        );
+        assert_eq!(
+            registry
+                .get_tool("default", "echo")
+                .map(|t| t.description)
+                .as_deref(),
+            Some("updated")
+        );
+
+        // An entry without a forwardId is a different owner from a forward.
+        registry.register_tool(ToolEntry {
+            name: "local".to_owned(),
+            ..sample_tool()
+        });
+        let skipped =
+            registry.register_tools_unless_taken(vec![owned_tool("local", "default", "a")]);
+        assert_eq!(skipped.len(), 1);
+    }
+
+    #[test]
+    fn remove_owned_by_keeps_entries_of_other_owners() {
+        let registry = InMemoryRegistry::new();
+        registry.register_tool(owned_tool("echo", "default", "a"));
+        registry.register_tool(owned_tool("echo", "other", "b"));
+        registry.register_tool(owned_tool("extra", "third", "b"));
+        registry.register_resource(ResourceEntry {
+            namespace: Some("other".to_owned()),
+            forward_id: Some("b".to_owned()),
+            ..sample_resource()
+        });
+        registry.register_resource(ResourceEntry {
+            forward_id: Some("a".to_owned()),
+            ..sample_resource()
+        });
+
+        assert_eq!(registry.remove_tools_owned_by("b"), 2);
+        assert_eq!(registry.remove_resources_owned_by("b"), 1);
+        assert_eq!(registry.remove_prompts_owned_by("b"), 0);
+
+        assert!(registry.get_tool("default", "echo").is_some());
+        assert!(registry.get_tool("other", "echo").is_none());
+        assert!(registry.get_tool("third", "extra").is_none());
+        assert!(registry.get_resource("default", "test-resource").is_some());
+        assert!(registry.get_resource("other", "test-resource").is_none());
+    }
+
+    #[test]
+    fn disabled_resource_is_hidden_from_namespace_lookups() {
+        let registry = InMemoryRegistry::new();
+        registry.register_resource(sample_resource());
+
+        assert!(registry.set_resource_enabled(DEFAULT_NAMESPACE, "test-resource", false));
+        assert!(
+            registry
+                .list_resources_in_namespace(DEFAULT_NAMESPACE)
+                .is_empty()
+        );
+        assert!(
+            registry
+                .get_resource_in_namespace(DEFAULT_NAMESPACE, "test-resource")
+                .is_none()
+        );
+        assert_eq!(registry.list_resources().len(), 1);
+    }
+
+    #[test]
+    fn disabled_prompt_is_hidden_from_namespace_lookups() {
+        let registry = InMemoryRegistry::new();
+        registry.register_prompt(PromptEntry {
+            name: "test-prompt".to_owned(),
+            description: String::new(),
+            arguments: Vec::new(),
+            messages: Vec::new(),
+            id: None,
+            namespace: None,
+            forward_id: None,
+            enabled: true,
+        });
+
+        assert!(registry.set_prompt_enabled(DEFAULT_NAMESPACE, "test-prompt", false));
+        assert!(
+            registry
+                .list_prompts_in_namespace(DEFAULT_NAMESPACE)
+                .is_empty()
+        );
+        assert!(
+            registry
+                .get_prompt_in_namespace(DEFAULT_NAMESPACE, "test-prompt")
+                .is_none()
+        );
+        assert_eq!(registry.list_prompts().len(), 1);
+    }
+
+    #[test]
+    fn register_and_list_resources() {
+        let registry = InMemoryRegistry::new();
+        registry.register_resource(sample_resource());
+        let resources = registry.list_resources();
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].name, "test-resource");
+    }
+
+    #[test]
+    fn get_resource_by_name() {
+        let registry = InMemoryRegistry::new();
+        registry.register_resource(sample_resource());
+        let res = registry.get_resource(DEFAULT_NAMESPACE, "test-resource");
+        assert!(res.is_some());
+        assert_eq!(
+            res.as_ref().map(|r| r.location.as_str()),
+            Some("/tmp/test.txt")
+        );
+    }
+
+    #[test]
+    fn remove_resource() {
+        let registry = InMemoryRegistry::new();
+        registry.register_resource(sample_resource());
+        assert!(registry.remove_resource(DEFAULT_NAMESPACE, "test-resource"));
+        assert!(
+            registry
+                .get_resource(DEFAULT_NAMESPACE, "test-resource")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn register_tool_skips_injection_when_disabled() {
+        let registry = InMemoryRegistry::new();
+        let tool = ToolEntry {
+            name: "test".to_owned(),
+            description: "test tool".to_owned(),
+            uri: "test://uri".to_owned(),
+            type_: "test".to_owned(),
+            mcp: Default::default(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "msg": {"type": "string"}
+                }
+            }),
+            namespace: None,
+            id: None,
+            forward_id: None,
+            labels: std::collections::HashMap::new(),
+            enabled: true,
+        };
+        registry.register_tool(tool);
+        let stored = registry
+            .get_tool(DEFAULT_NAMESPACE, "test")
+            .expect("tool should exist");
+        let props = stored.input_schema["properties"]
+            .as_object()
+            .expect("has properties");
+        assert_eq!(
+            props.len(),
+            1,
+            "x-request-id should not be injected when flag is disabled"
+        );
+    }
+
+    #[test]
+    fn register_tool_injects_when_enabled() {
+        let registry = InMemoryRegistry::new();
+        registry.enable_request_id_injection();
+        let tool = ToolEntry {
+            name: "test".to_owned(),
+            description: "test tool".to_owned(),
+            uri: "test://uri".to_owned(),
+            type_: "test".to_owned(),
+            mcp: Default::default(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "msg": {"type": "string"}
+                }
+            }),
+            namespace: None,
+            id: None,
+            forward_id: None,
+            labels: std::collections::HashMap::new(),
+            enabled: true,
+        };
+        registry.register_tool(tool);
+        let stored = registry
+            .get_tool(DEFAULT_NAMESPACE, "test")
+            .expect("tool should exist");
+        let props = stored.input_schema["properties"]
+            .as_object()
+            .expect("has properties");
+        assert_eq!(
+            props.len(),
+            2,
+            "x-request-id should be injected when flag is enabled"
+        );
+        assert!(props.contains_key("x-request-id"));
+    }
+
+    fn sample_forward(name: &str, namespace: Option<&str>) -> ForwardEntry {
+        ForwardEntry {
+            name: name.to_owned(),
+            address: "http://localhost:9090/mcp".to_owned(),
+            namespace: namespace.map(str::to_owned),
+            server_info: None,
+            labels: HashMap::new(),
+            available: false,
+            status_message: None,
+            credential_bindings: HashMap::new(),
+        }
+    }
+
+    fn sample_binding(id: &str, forward_id: &str) -> CredentialBinding {
+        use wanaku_types::credentials::{
+            BindingRestrictions, CacheRules, CredentialPurpose, InjectionMechanism,
+            NormalizedOrigin, SecretRef,
+        };
+        CredentialBinding {
+            id: id.to_owned(),
+            forward_id: forward_id.to_owned(),
+            origin: NormalizedOrigin::from_address("https://api.example.com")
+                .expect("valid origin"),
+            mechanism: InjectionMechanism::Bearer,
+            secret_refs: vec![SecretRef::parse("env:API_TOKEN").expect("valid secret ref")],
+            allowed_purposes: vec![CredentialPurpose::Invocation],
+            restrictions: BindingRestrictions::default(),
+            cache: CacheRules::default(),
+            revision: 1,
+        }
+    }
+
+    #[test]
+    fn register_and_get_binding() {
+        let registry = InMemoryRegistry::new();
+        registry.register_binding(sample_binding("b1", "fwd-a"));
+
+        let binding = registry.get_binding("b1").expect("binding should exist");
+        assert_eq!(binding.id, "b1");
+        assert_eq!(binding.forward_id, "fwd-a");
+        assert_eq!(registry.binding_count(), 1);
+    }
+
+    #[test]
+    fn list_bindings_for_forward_filters_by_owner() {
+        let registry = InMemoryRegistry::new();
+        registry.register_binding(sample_binding("b1", "fwd-a"));
+        registry.register_binding(sample_binding("b2", "fwd-a"));
+        registry.register_binding(sample_binding("b3", "fwd-b"));
+
+        let owned = registry.list_bindings_for_forward("fwd-a");
+        assert_eq!(owned.len(), 2);
+        assert!(owned.iter().all(|b| b.forward_id == "fwd-a"));
+    }
+
+    #[test]
+    fn register_binding_bumps_revision_on_change() {
+        let registry = InMemoryRegistry::new();
+        registry.register_binding(sample_binding("b1", "fwd-a"));
+
+        // Identical re-registration keeps the revision unchanged.
+        registry.register_binding(sample_binding("b1", "fwd-a"));
+        assert_eq!(
+            registry.get_binding("b1").expect("binding exists").revision,
+            1
+        );
+
+        // A content change bumps the revision.
+        let mut changed = sample_binding("b1", "fwd-a");
+        changed.allowed_purposes = vec![wanaku_types::credentials::CredentialPurpose::Discovery];
+        registry.register_binding(changed);
+        assert_eq!(
+            registry.get_binding("b1").expect("binding exists").revision,
+            2
+        );
+    }
+
+    #[test]
+    fn remove_binding_removes_entry() {
+        let registry = InMemoryRegistry::new();
+        registry.register_binding(sample_binding("b1", "fwd-a"));
+        assert!(registry.remove_binding("b1"));
+        assert!(registry.get_binding("b1").is_none());
+        assert!(!registry.remove_binding("b1"));
+    }
+
+    fn owned_forward(owner: &str) -> ForwardEntry {
+        let mut forward = sample_forward("owned", None);
+        forward.labels.insert("owner".to_owned(), owner.to_owned());
+        forward
+    }
+
+    fn owned_by(owner: &str) -> impl Fn(&ForwardEntry) -> bool + '_ {
+        move |forward| forward.labels.get("owner").map(String::as_str) == Some(owner)
+    }
+
+    #[test]
+    fn remove_forward_if_reports_each_outcome() {
+        let registry = InMemoryRegistry::new();
+        assert!(matches!(
+            registry.remove_forward_if("owned", owned_by("a")),
+            ConditionalRemoval::NotFound
+        ));
+        registry.register_forward(owned_forward("a"));
+        assert!(matches!(
+            registry.remove_forward_if("owned", owned_by("b")),
+            ConditionalRemoval::PreconditionFailed
+        ));
+        assert!(registry.get_forward("owned").is_some());
+        assert!(matches!(
+            registry.remove_forward_if("owned", owned_by("a")),
+            ConditionalRemoval::Removed(forward) if forward.labels["owner"] == "a"
+        ));
+        assert!(registry.get_forward("owned").is_none());
+    }
+
+    #[test]
+    fn remove_forward_if_keeps_upsert_made_after_owner_read() {
+        let registry = InMemoryRegistry::new();
+        registry.register_forward(owned_forward("a"));
+        // Instance "a" reads its forward, then instance "b" replaces it.
+        assert!(registry.get_forward("owned").is_some());
+        registry.register_forward(owned_forward("b"));
+        // The conditional delete from "a" must not remove the forward of "b".
+        assert!(matches!(
+            registry.remove_forward_if("owned", owned_by("a")),
+            ConditionalRemoval::PreconditionFailed
+        ));
+        assert_eq!(
+            registry
+                .get_forward("owned")
+                .map(|f| f.labels["owner"].clone()),
+            Some("b".to_owned())
+        );
+    }
+
+    #[test]
+    fn remove_forward_if_is_atomic_with_concurrent_upsert() {
+        for _ in 0..200 {
+            let registry = InMemoryRegistry::new();
+            registry.register_forward(owned_forward("a"));
+            let outcome = std::thread::scope(|scope| {
+                let remover = scope.spawn(|| registry.remove_forward_if("owned", owned_by("a")));
+                scope.spawn(|| registry.register_forward(owned_forward("b")));
+                remover.join()
+            })
+            .expect("remover thread");
+            // Whatever the order, only the forward of "a" may be removed and
+            // the forward of "b" always survives.
+            let allowed = match &outcome {
+                ConditionalRemoval::Removed(forward) => forward.labels["owner"] == "a",
+                ConditionalRemoval::PreconditionFailed => true,
+                ConditionalRemoval::NotFound => false,
+            };
+            assert!(allowed, "unexpected outcome: {outcome:?}");
+            assert_eq!(
+                registry
+                    .get_forward("owned")
+                    .map(|f| f.labels["owner"].clone()),
+                Some("b".to_owned())
+            );
+        }
+    }
+
+    #[test]
+    fn register_forward_registers_referenced_namespace() {
+        let registry = InMemoryRegistry::new();
+        registry.register_forward(sample_forward("example-mcp", Some("test-ns")));
+
+        let namespace = registry.get_namespace("test-ns");
+        assert!(
+            namespace.is_some(),
+            "namespace referenced by forward should be registered"
+        );
+        assert_eq!(namespace.expect("namespace should exist").name, "test-ns");
+        assert!(
+            registry
+                .list_namespaces()
+                .iter()
+                .any(|ns| ns.name == "test-ns"),
+            "namespace referenced by forward should appear in list_namespaces"
+        );
+    }
+
+    #[test]
+    fn register_forward_without_namespace_uses_default() {
+        let registry = InMemoryRegistry::new();
+        registry.register_forward(sample_forward("example-mcp", None));
+
+        let forward = registry
+            .get_forward("example-mcp")
+            .expect("forward should exist");
+        assert_eq!(forward.namespace.as_deref(), Some(DEFAULT_NAMESPACE));
+        assert!(registry.get_namespace(DEFAULT_NAMESPACE).is_some());
+    }
+
+    #[test]
+    fn multiple_forwards_share_single_namespace_entry() {
+        let registry = InMemoryRegistry::new();
+        registry.register_forward(sample_forward("forward-a", Some("shared-ns")));
+        registry.register_forward(sample_forward("forward-b", Some("shared-ns")));
+
+        let matching: Vec<_> = registry
+            .list_namespaces()
+            .into_iter()
+            .filter(|ns| ns.name == "shared-ns")
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "multiple forwards should create a single namespace entry"
+        );
+    }
+
+    #[test]
+    fn register_forward_does_not_clobber_existing_namespace() {
+        let registry = InMemoryRegistry::new();
+        let mut labels = HashMap::new();
+        labels.insert("team".to_owned(), "finance".to_owned());
+        registry.register_namespace(NamespaceEntry {
+            members: None,
+            name: "test-ns".to_owned(),
+            labels: labels.clone(),
+            auth_required: Some(true),
+            audience: Some("finance-audience".to_owned()),
+        });
+
+        registry.register_forward(sample_forward("example-mcp", Some("test-ns")));
+
+        let namespace = registry
+            .get_namespace("test-ns")
+            .expect("namespace should exist");
+        assert_eq!(
+            namespace.labels, labels,
+            "existing namespace metadata must be preserved"
+        );
+        assert_eq!(namespace.auth_required, Some(true));
+        assert_eq!(namespace.audience.as_deref(), Some("finance-audience"));
+    }
+
+    #[test]
+    fn register_forward_with_invalid_namespace_is_rejected() {
+        let registry = InMemoryRegistry::new();
+        registry.register_forward(sample_forward("example-mcp", Some("Invalid NS")));
+
+        assert!(
+            registry.get_namespace("Invalid NS").is_none(),
+            "invalid namespace names should not be auto-registered"
+        );
+        assert!(registry.get_forward("example-mcp").is_none());
+    }
+
+    #[test]
+    fn load_persisted_registers_namespace_referenced_by_forward() {
+        struct SnapshotBackend {
+            forward: ForwardEntry,
+        }
+
+        impl PersistenceBackend for SnapshotBackend {
+            fn load(
+                &self,
+            ) -> Result<RegistrySnapshot, wanaku_types::persistence::PersistenceError> {
+                Ok(RegistrySnapshot {
+                    forwards: vec![self.forward.clone()],
+                    ..RegistrySnapshot::default()
+                })
+            }
+
+            fn save(
+                &self,
+                _snapshot: &RegistrySnapshot,
+            ) -> Result<(), wanaku_types::persistence::PersistenceError> {
+                Ok(())
+            }
+        }
+
+        let backend = Arc::new(SnapshotBackend {
+            forward: sample_forward("persisted-forward", Some("persisted-ns")),
+        });
+        let registry = InMemoryRegistry::with_persistence(backend);
+
+        registry.load_persisted();
+
+        assert!(registry.get_forward("persisted-forward").is_some());
+        assert!(
+            registry.get_namespace("persisted-ns").is_some(),
+            "a persisted forward namespace should be registered when the snapshot omits it"
+        );
+    }
+
+    struct FixedSnapshot(serde_json::Value);
+
+    impl PersistenceBackend for FixedSnapshot {
+        fn load(&self) -> Result<RegistrySnapshot, PersistenceError> {
+            serde_json::from_value(self.0.clone())
+                .map_err(|error| PersistenceError::Coordination(error.to_string()))
+        }
+
+        fn save(&self, _snapshot: &RegistrySnapshot) -> Result<(), PersistenceError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn load_persisted_reads_snapshot_written_before_namespace_keys() {
+        // Earlier versions stored entries with unique names and often without
+        // a namespace.
+        let backend = Arc::new(FixedSnapshot(serde_json::json!({
+            "tools": [
+                {"name": "legacy", "description": "", "uri": "u", "type": "mcp-forward",
+                 "inputSchema": {"type": "object"}},
+                {"name": "scoped", "description": "", "uri": "u", "type": "mcp-forward",
+                 "inputSchema": {"type": "object"}, "namespace": "finance"}
+            ],
+            "resources": [{"name": "r", "location": "l", "type": "mcp-forward"}],
+            "prompts": [{"name": "p"}]
+        })));
+        let registry = InMemoryRegistry::with_persistence(backend);
+        registry.load_persisted();
+
+        let legacy = registry.get_tool(DEFAULT_NAMESPACE, "legacy");
+        assert_eq!(
+            legacy.and_then(|t| t.namespace).as_deref(),
+            Some(DEFAULT_NAMESPACE)
+        );
+        assert!(registry.get_tool("finance", "scoped").is_some());
+        assert!(registry.get_tool(DEFAULT_NAMESPACE, "scoped").is_none());
+        assert!(registry.get_resource(DEFAULT_NAMESPACE, "r").is_some());
+        assert!(registry.get_prompt(DEFAULT_NAMESPACE, "p").is_some());
+    }
+
+    #[test]
+    fn load_persisted_keeps_same_name_in_two_namespaces() {
+        let tool = |namespace: &str, forward_id: &str| {
+            serde_json::json!({"name": "echo", "description": "", "uri": "u",
+                "type": "mcp-forward", "inputSchema": {"type": "object"},
+                "namespace": namespace, "forwardId": forward_id})
+        };
+        let backend = Arc::new(FixedSnapshot(serde_json::json!({
+            "tools": [tool("default", "a"), tool("other", "b")]
+        })));
+        let registry = InMemoryRegistry::with_persistence(backend);
+        registry.load_persisted();
+
+        assert_eq!(registry.tool_count(), 2);
+        assert!(registry.get_tool("default", "echo").is_some());
+        assert!(registry.get_tool("other", "echo").is_some());
+    }
+
+    struct BlockingBackend {
+        calls: std::sync::atomic::AtomicUsize,
+        active: std::sync::atomic::AtomicUsize,
+        max_active: std::sync::atomic::AtomicUsize,
+        snapshots: Mutex<Vec<RegistrySnapshot>>,
+        first_entered: std::sync::mpsc::Sender<()>,
+        release_first: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl PersistenceBackend for BlockingBackend {
+        fn load(&self) -> Result<RegistrySnapshot, PersistenceError> {
+            Ok(RegistrySnapshot::default())
+        }
+
+        fn save(&self, snapshot: &RegistrySnapshot) -> Result<(), PersistenceError> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                self.first_entered
+                    .send(())
+                    .map_err(|error| PersistenceError::Coordination(error.to_string()))?;
+                self.release_first
+                    .lock()
+                    .map_err(|error| PersistenceError::Coordination(error.to_string()))?
+                    .recv()
+                    .map_err(|error| PersistenceError::Coordination(error.to_string()))?;
+            }
+            self.snapshots
+                .lock()
+                .map_err(|error| PersistenceError::Coordination(error.to_string()))?
+                .push(RegistrySnapshot {
+                    agents: snapshot.agents.clone(),
+                    tools: snapshot.tools.clone(),
+                    resources: snapshot.resources.clone(),
+                    prompts: snapshot.prompts.clone(),
+                    forwards: snapshot.forwards.clone(),
+                    namespaces: snapshot.namespaces.clone(),
+                    bindings: snapshot.bindings.clone(),
+                });
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn persistence_coalesces_pending_snapshots_and_flushes_latest_generation() {
+        let (first_entered_tx, first_entered_rx) = std::sync::mpsc::channel();
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+        let backend = Arc::new(BlockingBackend {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            active: std::sync::atomic::AtomicUsize::new(0),
+            max_active: std::sync::atomic::AtomicUsize::new(0),
+            snapshots: Mutex::new(Vec::new()),
+            first_entered: first_entered_tx,
+            release_first: Mutex::new(release_first_rx),
+        });
+        let registry = InMemoryRegistry::with_persistence(backend.clone());
+
+        registry.register_tool(sample_tool());
+        assert!(
+            first_entered_rx
+                .recv_timeout(Duration::from_secs(2))
+                .is_ok()
+        );
+        assert!(registry.persistence_status().pending);
+
+        let mut second = sample_tool();
+        second.name = "second-tool".to_owned();
+        registry.register_tool(second);
+        let mut third = sample_tool();
+        third.name = "third-tool".to_owned();
+        registry.register_tool(third);
+
+        assert!(release_first_tx.send(()).is_ok());
+        assert!(registry.flush_persistence(Duration::from_secs(2)).is_ok());
+
+        let snapshots = backend.snapshots.lock().expect("snapshot lock");
+        assert_eq!(backend.max_active.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            snapshots.len(),
+            2,
+            "worker should coalesce pending snapshots"
+        );
+        let final_names: Vec<_> = snapshots
+            .last()
+            .into_iter()
+            .flat_map(|snapshot| snapshot.tools.iter().map(|tool| tool.name.as_str()))
+            .collect();
+        assert_eq!(final_names.len(), 3);
+        assert!(final_names.contains(&"third-tool"));
+        assert_eq!(
+            registry.persistence_status().last_successful_generation,
+            Some(3)
+        );
+    }
+
+    struct FailingBackend;
+
+    impl PersistenceBackend for FailingBackend {
+        fn load(&self) -> Result<RegistrySnapshot, PersistenceError> {
+            Ok(RegistrySnapshot::default())
+        }
+
+        fn save(&self, _snapshot: &RegistrySnapshot) -> Result<(), PersistenceError> {
+            Err(PersistenceError::Coordination("write failed".to_owned()))
+        }
+    }
+
+    #[test]
+    fn persistence_failure_is_reported_by_flush_and_status() {
+        let registry = InMemoryRegistry::with_persistence(Arc::new(FailingBackend));
+        registry.register_tool(sample_tool());
+
+        assert!(registry.flush_persistence(Duration::from_secs(2)).is_err());
+        let status = registry.persistence_status();
+        assert!(status.enabled);
+        assert!(!status.pending);
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some(REGISTRY_PERSISTENCE_ERROR)
+        );
+    }
+
+    #[test]
+    fn disabled_persistence_has_no_pending_work() {
+        let registry = InMemoryRegistry::new();
+
+        assert!(registry.flush_persistence(Duration::from_secs(1)).is_ok());
+        assert_eq!(
+            registry.persistence_status(),
+            RegistryPersistenceStatus {
+                enabled: false,
+                pending: false,
+                last_successful_generation: None,
+                last_error: None,
+            }
+        );
+    }
+    /// Persistence backend that keeps the snapshot as a JSON string.
+    struct Backend(Mutex<String>);
+    impl PersistenceBackend for Backend {
+        fn load(&self) -> Result<RegistrySnapshot, PersistenceError> {
+            let value = self.0.lock().expect("test backend");
+            if value.is_empty() {
+                Ok(RegistrySnapshot::default())
+            } else {
+                Ok(serde_json::from_str(&value)?)
+            }
+        }
+        fn save(&self, snapshot: &RegistrySnapshot) -> Result<(), PersistenceError> {
+            *self.0.lock().expect("test backend") = serde_json::to_string(snapshot)?;
+            Ok(())
+        }
+    }
+
+    fn labeled_agent(owner: &str) -> wanaku_types::agents::AgentEntry {
+        serde_json::from_value(serde_json::json!({
+            "name": "worker",
+            "address": "http://agent.example/rpc",
+            "labels": {"owner": owner}
+        }))
+        .expect("agent")
+    }
+
+    fn agent_owned_by(owner: &str) -> impl Fn(&wanaku_types::agents::AgentEntry) -> bool + '_ {
+        move |agent| agent.labels.get("owner").map(String::as_str) == Some(owner)
+    }
+
+    #[test]
+    fn agent_labels_survive_persistence_and_old_snapshots_load() {
+        let backend = Arc::new(Backend(Mutex::new(String::new())));
+        let registry = InMemoryRegistry::with_persistence(backend.clone());
+        assert!(
+            registry
+                .save_agent(labeled_agent("a"), false)
+                .expect("create")
+        );
+        registry
+            .flush_persistence(Duration::from_secs(2))
+            .expect("persisted");
+        let recovered = InMemoryRegistry::with_persistence(backend);
+        recovered.load_persisted();
+        let agent = recovered.get_agent("default", "worker").expect("recovered");
+        assert_eq!(agent.labels.get("owner").map(String::as_str), Some("a"));
+
+        let old = r#"{"agents":[{"name":"worker","address":"http://agent.example/rpc"}]}"#;
+        let old_backend = Arc::new(Backend(Mutex::new(old.to_owned())));
+        let from_old = InMemoryRegistry::with_persistence(old_backend);
+        from_old.load_persisted();
+        let agent = from_old.get_agent("default", "worker").expect("old agent");
+        assert!(agent.labels.is_empty());
+    }
+
+    #[test]
+    fn remove_agent_if_reports_each_outcome() {
+        let registry = InMemoryRegistry::new();
+        assert!(matches!(
+            registry.remove_agent_if("default", "worker", agent_owned_by("a")),
+            ConditionalRemoval::NotFound
+        ));
+        assert!(
+            registry
+                .save_agent(labeled_agent("b"), false)
+                .expect("create")
+        );
+        assert!(matches!(
+            registry.remove_agent_if("default", "worker", agent_owned_by("a")),
+            ConditionalRemoval::PreconditionFailed
+        ));
+        assert!(registry.get_agent("default", "worker").is_some());
+        assert!(matches!(
+            registry.remove_agent_if("default", "worker", agent_owned_by("b")),
+            ConditionalRemoval::Removed(agent) if agent.labels["owner"] == "b"
+        ));
+        assert!(
+            registry
+                .agent_endpoint("default", "worker", false)
+                .is_none()
+        );
+    }
+
+    /// Run a conditional delete for owner "a" and an update to owner "b" at
+    /// the same time.
+    fn race_owner_delete_with_update(
+        registry: &InMemoryRegistry,
+    ) -> (ConditionalRemoval<wanaku_types::agents::AgentEntry>, bool) {
+        std::thread::scope(|scope| {
+            let remover =
+                scope.spawn(|| registry.remove_agent_if("default", "worker", agent_owned_by("a")));
+            let updater = scope.spawn(|| registry.save_agent(labeled_agent("b"), true));
+            let updated = updater.join().expect("updater thread");
+            (
+                remover.join().expect("remover thread"),
+                updated.expect("valid agent"),
+            )
+        })
+    }
+
+    #[test]
+    fn remove_agent_if_is_atomic_with_concurrent_update() {
+        for _ in 0..200 {
+            let registry = InMemoryRegistry::new();
+            registry
+                .save_agent(labeled_agent("a"), false)
+                .expect("create");
+            let (removal, updated) = race_owner_delete_with_update(&registry);
+            // Either the delete of "a" ran first and the update found no agent,
+            // or the update of "b" ran first and the delete precondition failed.
+            let owner = registry
+                .get_agent("default", "worker")
+                .map(|agent| agent.labels["owner"].clone());
+            let consistent = match &removal {
+                ConditionalRemoval::Removed(agent) => {
+                    agent.labels["owner"] == "a" && !updated && owner.is_none()
+                }
+                ConditionalRemoval::PreconditionFailed => updated && owner.as_deref() == Some("b"),
+                ConditionalRemoval::NotFound => false,
+            };
+            assert!(
+                consistent,
+                "unexpected outcome: {removal:?}, updated: {updated}"
+            );
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "namespace isolation and persistence recovery fixtures"
+    )]
+    fn agents_are_isolated_updated_live_and_recovered_from_snapshots() {
+        let backend = Arc::new(Backend(Mutex::new(String::new())));
+        let registry = InMemoryRegistry::with_persistence(backend.clone());
+        let mut agent: wanaku_types::agents::AgentEntry =
+            serde_json::from_str(r#"{"name":"worker","address":"http://first.example/rpc"}"#)
+                .expect("agent");
+        assert!(registry.save_agent(agent.clone(), false).expect("create"));
+        assert!(
+            !registry
+                .save_agent(agent.clone(), false)
+                .expect("duplicate")
+        );
+        agent.namespace = "blue".to_owned();
+        assert!(
+            registry
+                .save_agent(agent.clone(), false)
+                .expect("other namespace")
+        );
+        agent.address = "https://second.example/rpc".to_owned();
+        assert!(registry.save_agent(agent.clone(), true).expect("update"));
+        assert_eq!(
+            &*registry
+                .agent_endpoint("blue", "worker", false)
+                .expect("endpoint")
+                .upstream
+                .address,
+            "second.example:443"
+        );
+        assert_eq!(
+            registry
+                .get_agent("default", "worker")
+                .expect("isolated agent")
+                .address,
+            "http://first.example/rpc"
+        );
+        agent.address = "file:///tmp/invalid".to_owned();
+        assert!(registry.save_agent(agent, true).is_err());
+        assert_eq!(
+            registry
+                .get_agent("blue", "worker")
+                .expect("preserved agent")
+                .address,
+            "https://second.example/rpc"
+        );
+        registry
+            .flush_persistence(Duration::from_secs(2))
+            .expect("persisted");
+        let recovered = InMemoryRegistry::with_persistence(backend);
+        recovered.load_persisted();
+        assert_eq!(recovered.list_agents().len(), 2);
+        assert!(recovered.get_namespace("blue").is_some());
+        assert!(recovered.remove_agent("blue", "worker"));
+        assert!(recovered.agent_endpoint("blue", "worker", false).is_none());
+        assert!(recovered.get_agent("default", "worker").is_some());
+        let old: RegistrySnapshot = serde_json::from_str("{}").expect("old snapshot");
+        assert!(old.agents.is_empty());
+    }
+}

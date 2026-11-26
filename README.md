@@ -44,8 +44,10 @@ cargo openapi --check crates/rhaf-api/openapi.json
 ## Run the embedded runtime
 
 Core uses Wanaku's public `App::build` API and its Praxis/Pingora pipeline.
-Core pins Wanaku to commit
+Core uses Wanaku commit
 [`1a22a9e692e2f50aed56913000be3def38a7ca2c`](https://github.com/wanaku-ai/wanaku/commit/1a22a9e692e2f50aed56913000be3def38a7ca2c).
+The [local Wanaku backport](vendor/wanaku/README.md) removes credential-bearing
+forward URLs from startup and discovery diagnostics.
 The dependency disables the upstream admin UI. The MCP and management handlers
 share one registry, credential broker, and audit store. The public Wanaku
 management and reconnect services use guarded forward discovery publication.
@@ -130,8 +132,7 @@ Use `env:VARIABLE_NAME` in a binding's `secretRefs` list. Set the variable in
 the Core process environment. Keep secret values out of configuration files.
 Core resolves brokered credentials only for HTTPS destinations. Credential-free
 HTTP forwards remain available.
-Keep credentials out of forward URLs, including query parameters. The pinned
-Wanaku version can write these URLs to logs.
+Keep credentials out of forward URLs, including query parameters.
 
 To combine concrete namespaces, add a virtual namespace to the bootstrap file:
 
@@ -163,8 +164,10 @@ or healthy-forward catalog refresh.
 ## Verify real MCP forwarding
 
 Use Java 21 or later and Maven 3.9 or later for the controlled HTTP MCP fixture.
-Normal Rust builds and tests do not require Java or Maven. Build Core and the
-fixture:
+Normal Rust builds and tests do not require Java or Maven. The Rust process
+regression test uses a local HTTP fixture to verify forward URL redaction at
+DEBUG level and check that discovery sends the original request target. Build
+Core and the Java fixture:
 
 ```bash
 cargo build --workspace --locked

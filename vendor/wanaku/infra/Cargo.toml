@@ -1,0 +1,140 @@
+[package]
+edition = "2024"
+rust-version = "1.96"
+name = "wanaku-infra"
+version = "0.4.0-dev"
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+readme = false
+license = "Apache-2.0"
+
+[features]
+openapi = [
+    "dep:utoipa",
+    "wanaku-types/openapi",
+]
+
+[lib]
+name = "wanaku_infra"
+path = "src/lib.rs"
+
+[dependencies.async-trait]
+version = "0.1.89"
+
+[dependencies.dashmap]
+version = "6.2.1"
+
+[dependencies.http]
+version = "1.4.2"
+
+[dependencies.praxis-core]
+version = "0.7.5"
+package = "praxis-proxy-core"
+
+[dependencies.praxis-tls]
+version = "0.7.5"
+package = "praxis-proxy-tls"
+
+[dependencies.redb]
+version = "4.6.0"
+
+[dependencies.reqwest]
+version = "0.12"
+features = [
+    "rustls-tls",
+    "json",
+]
+default-features = false
+
+[dependencies.rmcp]
+version = "3.5.0"
+features = [
+    "client",
+    "transport-streamable-http-client-reqwest",
+    "reqwest",
+]
+default-features = false
+
+[dependencies.serde]
+version = "1.0"
+features = ["derive"]
+
+[dependencies.serde_json]
+version = "1.0"
+features = ["preserve_order"]
+
+[dependencies.thiserror]
+version = "2.0"
+
+[dependencies.time]
+version = "0.3.55"
+features = ["parsing"]
+
+[dependencies.tokio]
+version = "1"
+features = [
+    "macros",
+    "rt",
+]
+
+[dependencies.tracing]
+version = "0.1.44"
+
+[dependencies.utoipa]
+version = "6.0"
+optional = true
+
+[dependencies.wanaku-types]
+git = "https://github.com/wanaku-ai/wanaku"
+rev = "1a22a9e692e2f50aed56913000be3def38a7ca2c"
+
+[dev-dependencies]
+tempfile = "3"
+wiremock = "0.6"
+
+[lints.clippy]
+cast_possible_truncation = "warn"
+cast_possible_wrap = "warn"
+cast_sign_loss = "warn"
+cloned_instead_of_copied = "warn"
+cognitive_complexity = "warn"
+disallowed_methods = "deny"
+expect_used = "deny"
+flat_map_option = "warn"
+float_cmp = "warn"
+fn_params_excessive_bools = "warn"
+from_iter_instead_of_collect = "warn"
+if_not_else = "warn"
+implicit_clone = "warn"
+inefficient_to_string = "warn"
+large_futures = "warn"
+large_stack_frames = "warn"
+macro_use_imports = "warn"
+manual_let_else = "warn"
+map_unwrap_or = "warn"
+match_same_arms = "warn"
+missing_const_for_fn = "warn"
+needless_pass_by_value = "warn"
+panic = "deny"
+redundant_closure_for_method_calls = "warn"
+redundant_else = "warn"
+semicolon_if_nothing_returned = "warn"
+struct_excessive_bools = "warn"
+too_many_arguments = "warn"
+too_many_lines = "warn"
+trivially_copy_pass_by_ref = "warn"
+type_complexity = "warn"
+unnested_or_patterns = "warn"
+unreadable_literal = "warn"
+unused_self = "warn"
+unwrap_used = "deny"
+wildcard_imports = "warn"
+
+[lints.rust]
+unsafe_code = "deny"
+unused_imports = "deny"
+unused_variables = "deny"

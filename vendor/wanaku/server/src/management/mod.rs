@@ -1,0 +1,470 @@
+mod agents;
+mod handlers;
+#[cfg(test)]
+mod interaction_tests;
+mod persistence;
+mod reconnect;
+mod response;
+mod routes;
+#[cfg(feature = "ui")]
+mod ui;
+
+pub use handlers::{
+    PreparedForwardUpdate, apply_forward_update, discover_and_update_forward,
+    prepare_forward_update,
+};
+pub use persistence::{RegistryPersistenceService, registry_persistence_service};
+pub use reconnect::{ForwardReconnectService, reconnect_service};
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use http::{Response, StatusCode};
+use pingora_core::apps::http_app::ServeHttp;
+use pingora_core::protocols::http::ServerSession;
+
+use wanaku_infra::credentials::{CredentialAuditSink, CredentialBroker};
+use wanaku_infra::registry::InMemoryRegistry;
+use wanaku_types::feature::{Feature, HttpContext};
+
+use self::handlers::{
+    handle_binding_get, handle_binding_list, handle_forward_create, handle_forward_delete,
+    handle_forward_get, handle_forward_list, handle_forward_refresh, handle_info,
+    handle_namespace_create, handle_namespace_delete, handle_namespace_get, handle_namespace_list,
+    handle_namespace_update, handle_prompt_delete, handle_prompt_get, handle_prompt_list,
+    handle_prompt_set_enabled, handle_resource_delete, handle_resource_get, handle_resource_list,
+    handle_resource_set_enabled, handle_statistics, handle_tool_delete, handle_tool_get,
+    handle_tool_list, handle_tool_set_enabled, namespace_param, replace_requested,
+};
+#[cfg(feature = "ui")]
+use self::response::redirect_response;
+use self::response::{raw_json_response, read_body};
+use self::routes::{
+    BindingRoute, ForwardRoute, ManagementRoute, NamespaceRoute, PromptRoute, ResourceRoute,
+    ToolRoute, resolve_binding_route, resolve_forward_route, resolve_management_route,
+    resolve_namespace_route, resolve_prompt_route, resolve_resource_route, resolve_tool_route,
+};
+use crate::http_response::{json_err, json_ok};
+
+pub struct WanakuManagementService {
+    registry: InMemoryRegistry,
+    broker: Arc<CredentialBroker>,
+    audit_sink: Option<Arc<dyn CredentialAuditSink>>,
+    features: Vec<Box<dyn Feature>>,
+    #[cfg(feature = "ui")]
+    ui_path: Option<std::path::PathBuf>,
+}
+
+impl WanakuManagementService {
+    pub fn new(
+        registry: InMemoryRegistry,
+        broker: Arc<CredentialBroker>,
+        audit_sink: Option<Arc<dyn CredentialAuditSink>>,
+        features: Vec<Box<dyn Feature>>,
+    ) -> Self {
+        #[cfg(feature = "ui")]
+        let ui_path = wanaku_types::config::ENV.ui_path.clone();
+        #[cfg(feature = "ui")]
+        if let Some(p) = &ui_path {
+            tracing::info!(path = %p.display(), "Admin UI serving enabled");
+        }
+
+        Self {
+            registry,
+            broker,
+            audit_sink,
+            features,
+            #[cfg(feature = "ui")]
+            ui_path,
+        }
+    }
+
+    /// Dispatch one management API request.
+    ///
+    /// The Pingora service and the in-process server tests use this entry
+    /// point. It does not serve the embedded admin UI.
+    pub async fn dispatch(&self, ctx: &HttpContext<'_>) -> Response<Vec<u8>> {
+        dispatch(
+            ctx,
+            &self.registry,
+            &self.broker,
+            self.audit_sink.as_deref(),
+            &self.features,
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl ServeHttp for WanakuManagementService {
+    async fn response(&self, http_session: &mut ServerSession) -> Response<Vec<u8>> {
+        let req = http_session.req_header();
+        let uri = &req.uri;
+        let path = uri.path().to_owned();
+        let query = uri.query().map(std::borrow::ToOwned::to_owned);
+        let method = req.method.as_str().to_owned();
+        let headers = req.headers.clone();
+
+        #[cfg(feature = "ui")]
+        {
+            if path == "/" {
+                return redirect_response("/admin/");
+            }
+
+            if path.starts_with("/admin") {
+                return ui::serve_ui(&self.ui_path, &path);
+            }
+        }
+
+        let body = match method.as_str() {
+            "POST" | "PUT" | "PATCH" if path.starts_with("/api/") => {
+                match read_body(http_session).await {
+                    Ok(b) => Some(b),
+                    Err(resp) => return resp,
+                }
+            }
+            _ => None,
+        };
+
+        let ctx = HttpContext::new(&method, &path, query.as_deref(), body.as_deref(), &headers);
+        self.dispatch(&ctx).await
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "route dispatch requires sequential matching"
+)]
+pub(crate) async fn dispatch(
+    ctx: &HttpContext<'_>,
+    registry: &InMemoryRegistry,
+    broker: &CredentialBroker,
+    audit_sink: Option<&dyn CredentialAuditSink>,
+    features: &[Box<dyn Feature>],
+) -> Response<Vec<u8>> {
+    if let Some(response) = agents::dispatch(ctx, registry) {
+        return response;
+    }
+    if ctx.path == "/healthz" || ctx.path == "/health" {
+        return json_ok(&serde_json::json!({"status": "ok"}));
+    }
+
+    if ctx.path == "/openapi.json" {
+        let openapi_body = crate::openapi::openapi_json();
+        return raw_json_response(openapi_body);
+    }
+
+    match resolve_management_route(ctx.method, ctx.path) {
+        ManagementRoute::Info => return handle_info(),
+        ManagementRoute::Statistics => return handle_statistics(registry),
+        ManagementRoute::NotFound => {}
+    }
+
+    tracing::debug!(method = %ctx.method, path = %ctx.path, "management API request");
+
+    match resolve_tool_route(ctx.method, ctx.path) {
+        ToolRoute::List => return handle_tool_list(registry),
+        ToolRoute::GetByName(name) => {
+            return handle_tool_get(registry, &namespace_param(ctx.query), &name);
+        }
+        ToolRoute::Delete(name) => {
+            return handle_tool_delete(registry, &namespace_param(ctx.query), &name);
+        }
+        ToolRoute::SetEnabled(name, enabled) => {
+            let namespace = namespace_param(ctx.query);
+            return handle_tool_set_enabled(registry, &namespace, &name, enabled);
+        }
+        ToolRoute::NotFound => {}
+    }
+
+    match resolve_resource_route(ctx.method, ctx.path) {
+        ResourceRoute::List => return handle_resource_list(registry),
+        ResourceRoute::GetByName(name) => {
+            return handle_resource_get(registry, &namespace_param(ctx.query), &name);
+        }
+        ResourceRoute::Delete(name) => {
+            return handle_resource_delete(registry, &namespace_param(ctx.query), &name);
+        }
+        ResourceRoute::SetEnabled(name, enabled) => {
+            let namespace = namespace_param(ctx.query);
+            return handle_resource_set_enabled(registry, &namespace, &name, enabled);
+        }
+        ResourceRoute::NotFound => {}
+    }
+
+    match resolve_prompt_route(ctx.method, ctx.path) {
+        PromptRoute::List => return handle_prompt_list(registry),
+        PromptRoute::GetByName(name) => {
+            return handle_prompt_get(registry, &namespace_param(ctx.query), &name);
+        }
+        PromptRoute::Delete(name) => {
+            return handle_prompt_delete(registry, &namespace_param(ctx.query), &name);
+        }
+        PromptRoute::SetEnabled(name, enabled) => {
+            let namespace = namespace_param(ctx.query);
+            return handle_prompt_set_enabled(registry, &namespace, &name, enabled);
+        }
+        PromptRoute::NotFound => {}
+    }
+
+    match resolve_namespace_route(ctx.method, ctx.path) {
+        NamespaceRoute::List => return handle_namespace_list(registry),
+        NamespaceRoute::GetByName(name) => return handle_namespace_get(registry, &name),
+        NamespaceRoute::Create => {
+            return match ctx.body {
+                Some(b) => handle_namespace_create(registry, b),
+                None => json_err(StatusCode::BAD_REQUEST, "request body required"),
+            };
+        }
+        NamespaceRoute::Update(id) => {
+            return match ctx.body {
+                Some(b) => handle_namespace_update(registry, &id, b),
+                None => json_err(StatusCode::BAD_REQUEST, "request body required"),
+            };
+        }
+        NamespaceRoute::Delete(name) => return handle_namespace_delete(registry, &name),
+        NamespaceRoute::NotFound => {}
+    }
+
+    match resolve_binding_route(ctx.method, ctx.path) {
+        BindingRoute::List => return handle_binding_list(registry),
+        BindingRoute::GetById(id) => return handle_binding_get(registry, &id),
+        BindingRoute::NotFound => {}
+    }
+
+    match resolve_forward_route(ctx.method, ctx.path) {
+        ForwardRoute::List => return handle_forward_list(registry),
+        ForwardRoute::GetByName(name) => return handle_forward_get(registry, &name),
+        ForwardRoute::Create => {
+            return match ctx.body {
+                Some(b) => {
+                    let replace = replace_requested(ctx.query);
+                    handle_forward_create(registry, broker, audit_sink, b, replace).await
+                }
+                None => json_err(StatusCode::BAD_REQUEST, "request body required"),
+            };
+        }
+        ForwardRoute::Delete(name) => {
+            return handle_forward_delete(registry, broker, &name, ctx.query);
+        }
+        ForwardRoute::Refresh(name) => {
+            return handle_forward_refresh(registry, broker, audit_sink, &name).await;
+        }
+        ForwardRoute::NotFound => {}
+    }
+
+    for feature in features {
+        if let Some(response) = feature.handle_route(ctx).await {
+            return response;
+        }
+    }
+
+    json_err(
+        StatusCode::NOT_FOUND,
+        StatusCode::NOT_FOUND.canonical_reason().unwrap_or_default(),
+    )
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+    use wanaku_infra::registry::InMemoryRegistry;
+    use wanaku_types::credentials::ResolverRegistry;
+    use wanaku_types::feature::{Feature, HttpContext};
+
+    fn test_broker() -> CredentialBroker {
+        CredentialBroker::new(ResolverRegistry::new())
+    }
+
+    fn parse_body(resp: &http::Response<Vec<u8>>) -> serde_json::Value {
+        serde_json::from_slice(resp.body()).unwrap_or_default()
+    }
+
+    fn data_field(resp: &http::Response<Vec<u8>>) -> serde_json::Value {
+        let body = parse_body(resp);
+        body.get("data").cloned().unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn dispatch_get_tools_returns_empty_list() {
+        let registry = InMemoryRegistry::new();
+        let headers = http::HeaderMap::new();
+        let features: &[Box<dyn Feature>] = &[];
+        let ctx = HttpContext::new("GET", "/api/v1/tools", None, None, &headers);
+
+        let resp = dispatch(&ctx, &registry, &test_broker(), None, features).await;
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(data_field(&resp).as_array().map(|a| a.len()), Some(0));
+    }
+
+    #[tokio::test]
+    async fn dispatch_unknown_path_returns_404() {
+        let registry = InMemoryRegistry::new();
+        let headers = http::HeaderMap::new();
+        let features: &[Box<dyn Feature>] = &[];
+        let ctx = HttpContext::new("GET", "/no/such/path", None, None, &headers);
+
+        let resp = dispatch(&ctx, &registry, &test_broker(), None, features).await;
+
+        assert_eq!(resp.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn dispatch_post_namespace_create() {
+        let registry = InMemoryRegistry::new();
+        let headers = http::HeaderMap::new();
+        let features: &[Box<dyn Feature>] = &[];
+        let body = r#"{"name":"test-ns"}"#;
+        let ctx = HttpContext::new("POST", "/api/v1/namespaces", None, Some(body), &headers);
+
+        let resp = dispatch(&ctx, &registry, &test_broker(), None, features).await;
+
+        assert_eq!(resp.status(), 200);
+        let data = data_field(&resp);
+        assert_eq!(data.get("name").and_then(|v| v.as_str()), Some("test-ns"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_health_returns_ok() {
+        let registry = InMemoryRegistry::new();
+        let headers = http::HeaderMap::new();
+        let features: &[Box<dyn Feature>] = &[];
+        let ctx = HttpContext::new("GET", "/healthz", None, None, &headers);
+
+        let resp = dispatch(&ctx, &registry, &test_broker(), None, features).await;
+
+        assert_eq!(resp.status(), 200);
+        let body = parse_body(&resp);
+        let data = body.get("data").cloned().unwrap_or_default();
+        assert_eq!(data.get("status").and_then(|v| v.as_str()), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_info_returns_name_and_version() {
+        let registry = InMemoryRegistry::new();
+        let headers = http::HeaderMap::new();
+        let features: &[Box<dyn Feature>] = &[];
+        let ctx = HttpContext::new("GET", "/api/v1/management/info", None, None, &headers);
+
+        let resp = dispatch(&ctx, &registry, &test_broker(), None, features).await;
+
+        assert_eq!(resp.status(), 200);
+        let data = data_field(&resp);
+        assert!(data.get("name").and_then(|v| v.as_str()).is_some());
+        assert!(data.get("version").and_then(|v| v.as_str()).is_some());
+    }
+
+    /// Test feature that owns only `GET /api/v1/tools-export`.
+    struct ToolsExportFeature;
+
+    #[async_trait]
+    impl Feature for ToolsExportFeature {
+        fn name(&self) -> &'static str {
+            "tools-export"
+        }
+
+        fn register_filters(&self, _registry: &mut praxis_filter::FilterRegistry) {}
+
+        fn pipeline_extensions(&self) -> Vec<Box<dyn praxis_filter::PipelineExtension>> {
+            Vec::new()
+        }
+
+        async fn handle_route(&self, ctx: &HttpContext<'_>) -> Option<Response<Vec<u8>>> {
+            match (ctx.method, ctx.path) {
+                ("GET", "/api/v1/tools-export") => {
+                    Some(json_ok(&serde_json::json!({"owner": "tools-export"})))
+                }
+                _ => None,
+            }
+        }
+
+        fn load_yaml_config(&self, _root: &serde_yaml::Value) {}
+
+        fn load_env_config(&self) {}
+    }
+
+    #[tokio::test]
+    async fn dispatch_sibling_prefix_reaches_feature() {
+        let registry = InMemoryRegistry::new();
+        let headers = http::HeaderMap::new();
+        let features: Vec<Box<dyn Feature>> = vec![Box::new(ToolsExportFeature)];
+        let ctx = HttpContext::new("GET", "/api/v1/tools-export", None, None, &headers);
+
+        let resp = dispatch(&ctx, &registry, &test_broker(), None, &features).await;
+
+        assert_eq!(resp.status(), 200);
+        let data = data_field(&resp);
+        assert_eq!(
+            data.get("owner").and_then(|v| v.as_str()),
+            Some("tools-export")
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_sibling_prefix_mutations_return_404() {
+        use wanaku_types::registry::{ForwardRegistry, NamespaceRegistry};
+
+        let registry = InMemoryRegistry::new();
+        let headers = http::HeaderMap::new();
+        let features: &[Box<dyn Feature>] = &[];
+        let namespaces_before = registry.list_namespaces().len();
+        let forwards_before = registry.list_forwards().len();
+
+        let cases = [
+            ("/api/v1/namespaces-extra", r#"{"name":"extra-ns"}"#),
+            (
+                "/api/v1/forwards-extra",
+                r#"{"name":"extra-fwd","address":"http://127.0.0.1:1/mcp"}"#,
+            ),
+        ];
+        for (path, body) in cases {
+            let ctx = HttpContext::new("POST", path, None, Some(body), &headers);
+            let resp = dispatch(&ctx, &registry, &test_broker(), None, features).await;
+            assert_eq!(resp.status(), 404, "{path}");
+        }
+
+        assert_eq!(registry.list_namespaces().len(), namespaces_before);
+        assert_eq!(registry.list_forwards().len(), forwards_before);
+    }
+
+    #[tokio::test]
+    async fn dispatch_forward_delete_passes_label_precondition() {
+        use wanaku_types::registry::{ForwardEntry, ForwardRegistry};
+        let registry = InMemoryRegistry::new();
+        registry.register_forward(ForwardEntry {
+            name: "fwd".to_owned(),
+            address: "http://x:1".to_owned(),
+            namespace: None,
+            server_info: None,
+            labels: std::collections::HashMap::from([("owner".to_owned(), "b".to_owned())]),
+            available: true,
+            status_message: None,
+            credential_bindings: std::collections::HashMap::new(),
+        });
+        let headers = http::HeaderMap::new();
+        let features: &[Box<dyn Feature>] = &[];
+        let path = "/api/v1/forwards/fwd";
+        let stale = HttpContext::new("DELETE", path, Some("label.owner=a"), None, &headers);
+        let owner = HttpContext::new("DELETE", path, Some("label.owner=b"), None, &headers);
+
+        let conflict = dispatch(&stale, &registry, &test_broker(), None, features).await;
+        let removed = dispatch(&owner, &registry, &test_broker(), None, features).await;
+
+        assert_eq!(conflict.status(), 409);
+        assert_eq!(removed.status(), 200);
+        assert!(registry.get_forward("fwd").is_none());
+    }
+
+    #[tokio::test]
+    async fn dispatch_post_without_body_returns_400() {
+        let registry = InMemoryRegistry::new();
+        let headers = http::HeaderMap::new();
+        let features: &[Box<dyn Feature>] = &[];
+        let ctx = HttpContext::new("POST", "/api/v1/namespaces", None, None, &headers);
+
+        let resp = dispatch(&ctx, &registry, &test_broker(), None, features).await;
+
+        assert_eq!(resp.status(), 400);
+    }
+}
